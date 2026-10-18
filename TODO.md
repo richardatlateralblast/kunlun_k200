@@ -6,7 +6,9 @@ See `RESEARCH.md` for the findings behind these items (K200-on-modern-host work)
 
 ## Open
 
-- [ ] Try pointing the official `paddlepaddle-xpu` wheel at this repo's own, proven-correct `libxpuapi.so` (via `LD_LIBRARY_PATH` or by replacing the wheel's bundled copy) to see if it fixes the silent-zero-result bug. ABI compatibility between the two builds is unknown; most promising untried lead for a working ML framework on this card.
+- [ ] Try pointing the official `paddlepaddle-xpu` wheel at this repo's own, proven-correct `libxpuapi.so` (via `LD_LIBRARY_PATH` or by replacing the wheel's bundled copy) to see if it fixes the silent-zero-result bug. ABI compatibility between the two builds is unknown; most promising untried lead for a working ML framework on this card. While there, also try PaddleNLP's XPU llama2-7b tutorial against K200 to get a hardware-confirmed answer on transformer-kernel support (see `RESEARCH.md` "Ollama / vLLM feasibility").
+- [ ] `nm -D`/`c++filt` the Paddle wheel's own bundled `libxpuapi.so` (on the R730, where it's installed) for `xpu1::` RoPE/SwiGLU/RMSNorm/paged-attention symbols, to check whether it has LLM kernels this repo's bundled copy (confirmed to lack them) doesn't.
+- [ ] Check whether Baidu's XTDK device compiler (needed to hand-write xpu1 cluster kernels for a custom llama.cpp/ggml backend) is publicly obtainable at all. Blocks any custom-backend attempt for Ollama support regardless of the kernel-availability finding above.
 - [ ] Investigate the ~2x bandwidth shortfall vs the repo's documented peak (pageable H2D ~5.35 vs ~10.1 GB/s; `xpu_host_alloc` H2D ~6.29 vs ~12.5 GB/s) on the kernel-7.0 build, despite GEMM compute matching closely. Check PCIe link negotiation on this host/slot, NUMA placement, whether original S4-S9 numbers came from different hardware, or a regression in the stubbed DMA path.
 - [ ] Test `rmmod`/reload of `kunlun.ko` and survival across a reboot when installed via `scripts/install_driver.sh`/DKMS (currently only loaded by hand).
 - [ ] Test driver load under Secure Boot with a self-signed module (tested host currently has Secure Boot off).
