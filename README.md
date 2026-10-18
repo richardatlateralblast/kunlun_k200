@@ -49,7 +49,7 @@ After rebuild, record your own `srcversion` next to the knobs above. Older case 
 | HBM | 8 GB per XPU (16 GB per card) |
 | PCIe (K200) | Gen4 ×8 per card |
 | Phi 7220P (side track) | Knights Landing, PCI ID `8086:2260` (+ DMA fn `8086:2264`); **no driver yet** |
-| Host (generic) | x86_64 server-class CPU, Ubuntu 22.04, kernel **6.8.x** (rebuild `kunlun.ko` after kernel upgrade) |
+| Host (generic) | x86_64 server-class CPU, Ubuntu 22.04, kernel **6.8.x**, or kernel **7.0** with gcc 14+ (see [Building on Linux 6.15 / 7.0](#building-on-linux-615--70-gcc-14)); rebuild `kunlun.ko` after kernel upgrade |
 
 > Do **not** publish hostnames, absolute paths, full `lspci` dumps, or device serials in docs. Discover local BDFs with `lspci -nn \| grep -E '3684\|2260'`.  
 > Case numbers were measured on one XPU / same-card PD pairs; multi-card count does not change S4–S6 bandwidth floors.
@@ -148,6 +148,37 @@ make regression
 
 Boot-time options: `/etc/modprobe.d/kunlun-kl1.conf` (maintained by `install_driver.sh`).  
 Details: [`kunlun-driver/BUILD.md`](kunlun-driver/BUILD.md), closure §4.
+
+### Building on Linux 6.15 / 7.0 (gcc 14+)
+
+This tree builds on kernel `7.0.0-38-generic` with gcc 15.2 (checked on a Dell R730: `vermagic` matches, no unresolved symbols). The module then loaded by hand and bound to the card (`/dev/xpu0`, `/dev/xpu1`, `/dev/xpuctrl`, `/proc/xpu`, no warnings in `dmesg`). **No workload has been run on the card yet**, so the DMA stubs listed below are unproven under load. Background and full write-up: [`docs/BUILD-linux-7.md`](docs/BUILD-linux-7.md).
+
+```bash
+sudo apt install build-essential linux-headers-$(uname -r)
+
+# gcc 15 defaults to C23, which breaks the conftest probes: force gnu11
+printf '#!/bin/sh\nexec gcc -std=gnu11 "$@"\n' > ~/gcc11 && chmod +x ~/gcc11
+
+cd kunlun-driver
+make clean
+rm -rf kunlun_module/conftest/*.h          # force the probes to run again
+make modules CC=$HOME/gcc11 -j8            # -> kunlun.ko, kunlun_peermem.ko
+modinfo -F vermagic ./kunlun.ko            # must match uname -r
+cd ..
+```
+
+- Built with gcc 15.2 and the wrapper above; gcc 14 is untested. gcc 13 fails on a 7.0 kernel (it rejects `-fmin-function-alignment`).
+- To install, use `make driver-install-norebuild` (or `scripts/install_driver.sh`) on the `kunlun.ko` you just built. `make driver-install` depends on `make driver`, which would rebuild with the default `CC` and should fail the same way. Neither install path has been run on 7.0 yet.
+- Rebuild after every kernel upgrade; the `vermagic` must match `uname -r`.
+- **Load it by hand the first time** and read `dmesg` before installing it for boot:
+  `sudo insmod kunlun-driver/kunlun.ko kl1_p2p_stub=0 kl1_dma_direct=1 kl1_bounce_pipe=1`.
+  The module is unsigned, so Secure Boot blocks it and the kernel is tainted when it loads.
+
+What the changes do:
+
+- **Kbuild:** kernel 6.15+ ignores `EXTRA_CFLAGS`, so it is forwarded to `ccflags-y`. The conftest probe flags gain `-std=gnu11 -fms-extensions` (kernel 7.0 needs `-fms-extensions`; without it every probe that includes `pci.h` fails on a `sizeof(struct filename)` assertion and the driver takes old-kernel code paths). `-Wno-error=int-conversion` restores the pre-gcc-14 warning.
+- **API renames:** `in_irq` to `in_hardirq`; `del_timer` to `timer_delete`; `hrtimer_init` plus `.function` to `hrtimer_setup`; `nth_page(p, j)` to `p + j` (the pages come from one contiguous allocation); `follow_pfn` to `follow_pfnmap_start/end`.
+- **Stubs (untested guesses):** the "function is present" conftest probes are inverted and break on gcc 14+ (implicit declarations are errors), so `phys_to_dma` uses the plain address, `dma_is_direct` is assumed false, `dma_map_ops.map_resource` is treated as absent (the peer-DMA check returns false), and the console-lock and `jiffies_to_timespec` branches are disabled. `vm_flags_set`/`vm_flags_clear` are always used (`vm_flags` has been const since 6.3). A wrong guess here could hang the host or corrupt memory under load.
 
 ### Runtime knobs (`/sys/module/kunlun/parameters/`)
 
