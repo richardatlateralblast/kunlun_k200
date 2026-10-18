@@ -5,13 +5,14 @@
 Benchmarks and KL1 driver work for **Kunlun K200** inference cards: PCIe bandwidth, GEMM, Paddle ResNet-50, real-case demos (C1–C5), and driver fixes for same-card P2P / `xpu_host_alloc`.  
 Same host also tracks **Intel Xeon Phi 7220P (KNL)** bring-up and co-located AMD MI50 GPUs (not part of the K200 driver milestone).
 
-**Status (2026-08):**
+**Status (2026-08, kernel 7.0 row updated 2026-10):**
 
 | Track | State |
 |-------|--------|
 | K200 driver S0–S9 | **Closed** → [`docs/impl/20260715-project-closure.md`](docs/impl/20260715-project-closure.md) |
 | K200 cases C1–C5 + demo | **Delivered** → [`results/cases/SUMMARY.md`](results/cases/SUMMARY.md) |
 | K200 next work | Productize / real models / freeze → [`docs/plan/20260716-phase-after-abc.md`](docs/plan/20260716-phase-after-abc.md) |
+| K200 on kernel 7.0 / modern host | Driver builds, loads, compute confirmed correct; official Paddle wheel still broken → [Kernel 7.0 / modern host support](#kernel-70--modern-host-support), [`RESEARCH.md`](RESEARCH.md) |
 | Phi 7220P (KNL) | Phase 0 done · Phase 1 blocked on **Rocky 8 + MPSS 4.4.1** → [`docs/plan/20260805-xeon-phi-7220p-bringup.md`](docs/plan/20260805-xeon-phi-7220p-bringup.md) |
 
 **Repo:** [github.com/mobius/kunlun_k200](https://github.com/mobius/kunlun_k200) (`master`)
@@ -28,7 +29,7 @@ make all                          # builds benchmarks/ and tests/ against the bu
 ./benchmarks/xpu_perf_test 0      # full GEMM + bandwidth suite
 ```
 
-This assumes the kernel driver is already loaded (`lsmod | grep kunlun`). If not, or if you're on kernel 6.15+ (including 7.0), build and load it first — see [Install](#install) and [Building on Linux 6.15 / 7.0](#building-on-linux-615--70-gcc-14). **The built `kunlun.ko` is never committed** (`*.ko` is gitignored, like every compiled binary in this repo); there's no prebuilt module to download, so this build step is mandatory, not optional, for every kernel version including the ones this driver originally targeted.
+This assumes the kernel driver is already loaded (`lsmod | grep kunlun`). If not, or if you're on kernel 6.15+ (including 7.0), build and load it first — see [Install](#install) and [Kernel 7.0 / modern host support](#kernel-70--modern-host-support). **The built `kunlun.ko` is never committed** (`*.ko` is gitignored, like every compiled binary in this repo); there's no prebuilt module to download, so this build step is mandatory, not optional, for every kernel version including the ones this driver originally targeted.
 
 ### Live driver check (K200)
 
@@ -61,7 +62,7 @@ After rebuild, record your own `srcversion` next to the knobs above. Older case 
 | HBM | 8 GB per XPU (16 GB per card) |
 | PCIe (K200) | Gen4 ×8 per card |
 | Phi 7220P (side track) | Knights Landing, PCI ID `8086:2260` (+ DMA fn `8086:2264`); **no driver yet** |
-| Host (generic) | x86_64 server-class CPU, Ubuntu 22.04, kernel **6.8.x**, or kernel **7.0** with gcc 14+ (see [Building on Linux 6.15 / 7.0](#building-on-linux-615--70-gcc-14)); rebuild `kunlun.ko` after kernel upgrade |
+| Host (generic) | x86_64 server-class CPU, Ubuntu 22.04, kernel **6.8.x**, or kernel **7.0** with gcc 14+ (see [Kernel 7.0 / modern host support](#kernel-70--modern-host-support)); rebuild `kunlun.ko` after kernel upgrade |
 
 > Do **not** publish hostnames, absolute paths, full `lspci` dumps, or device serials in docs. Discover local BDFs with `lspci -nn \| grep -E '3684\|2260'`.  
 > Case numbers were measured on one XPU / same-card PD pairs; multi-card count does not change S4–S6 bandwidth floors.
@@ -161,11 +162,46 @@ make regression
 Boot-time options: `/etc/modprobe.d/kunlun-kl1.conf` (maintained by `install_driver.sh`).  
 Details: [`kunlun-driver/BUILD.md`](kunlun-driver/BUILD.md), closure §4.
 
-### Building on Linux 6.15 / 7.0 (gcc 14+)
+### Runtime knobs (`/sys/module/kunlun/parameters/`)
 
-This tree builds on kernel `7.0.0-38-generic` with gcc 15.2 (checked on a Dell R730: `vermagic` matches, no unresolved symbols). The module then loaded by hand and bound to the card (`/dev/xpu0`, `/dev/xpu1`, `/dev/xpuctrl`, `/proc/xpu`, no warnings in `dmesg`). Background and full write-up: [`docs/BUILD-linux-7.md`](docs/BUILD-linux-7.md).
+| Param | Prod default | Notes |
+|-------|:------------:|-------|
+| `kl1_dma_direct` | 1 | S4 host_alloc direct EDMA |
+| `kl1_bounce_pipe` | 1 | S6 pageable double-buffer |
+| `kl1_pageable_pin` | **0** | keep off (4K pin hangs/slow on large xfers) |
+| `kl1_p2p_stub` | 0 | debug path off |
+| `kl1_bounce_d2h` | 1 | S9 default; no extra pageable D2H win |
 
-**Workload result: the driver and xdnn compute are correct on this build.** `tests/test_host_alloc` and `tests/test_pageable_verify` both pass their pattern checks, and `benchmarks/xpu_perf_test` completes end to end with GEMM numbers matching this README's own [Key benchmarks](#key-benchmarks-k200-post-s9--cases) almost exactly (FP16 ~19–22 TFLOPS at 33–39% efficiency vs. the ~20 TFLOPS/~35% documented there; FP32 "large" 7685 GFLOPS/53.37% vs. the documented ~7.8 TFLOPS/~54%; INT8 correctly reports unsupported). Bandwidth is real and non-zero but roughly half the documented peak (pageable H2D up to 5.35 GB/s vs. the ~10.1 GB/s above; `xpu_host_alloc` H2D up to 6.29 GB/s vs. ~12.5 GB/s) — a performance gap worth investigating, but the DMA stubs below are not implicated by this result: they produce correct data, just slower than the original S4–S9 tuning run. See [Software stacks tried on this build](#software-stacks-tried-on-this-build) for what does and doesn't run on top of it.
+---
+
+## Kernel 7.0 / modern host support
+
+The S0–S9 work above targeted kernel 6.8. This section covers building and running the same driver on kernel 6.15+ (checked on `7.0.0-38-generic`, gcc 15.2, Dell R730). Full background: [`docs/BUILD-linux-7.md`](docs/BUILD-linux-7.md) and [`RESEARCH.md`](RESEARCH.md), which also tracks everything still open.
+
+### What works
+
+| Layer | Result |
+|-------|--------|
+| Driver build | `kunlun.ko`, `kunlun_peermem.ko` build clean, `vermagic` matches `uname -r` |
+| Driver load | Clean probe, `/dev/xpu0`, `/dev/xpu1`, `/dev/xpuctrl`, `/proc/xpu`, no `dmesg` warnings |
+| DMA correctness | `tests/test_host_alloc`, `tests/test_pageable_verify` pattern checks both pass |
+| GEMM compute (xdnn/XPURT direct) | FP16 ~19–22 TFLOPS at 33–39% eff. and FP32 7685 GFLOPS at 53.37% — matches the [Key benchmarks](#key-benchmarks-k200-post-s9--cases) above; INT8 correctly reports unsupported |
+
+### What doesn't (yet)
+
+| Layer | Result |
+|-------|--------|
+| PCIe bandwidth | Real, non-zero, but **roughly half** the documented peak (pageable H2D up to 5.35 vs. ~10.1 GB/s; `xpu_host_alloc` H2D up to 6.29 vs. ~12.5 GB/s). Compute is unaffected — see `RESEARCH.md` open questions. |
+| Official `paddlepaddle-xpu` 2.6.1 wheel | Detects the card (`device_count()` → 2) but gives **silently wrong results**: a plain `paddle.to_tensor(host_array).numpy()` round-trip, elementwise add, and matmul all come back all-zero with no error; `paddle.randn(...)` raises `XDNN_INVALID_PARAM`. Root cause: the wheel bundles its own, different-build `libxpuapi.so`, not this repo's driver or XPURT layer (both proven correct above). Not yet tried: forcing the wheel to load this repo's own `libxpuapi.so` instead. |
+| vLLM / FastDeploy / current PaddleOCR-XPU | **Not an option on this card at all**, independent of driver state: these all target Kunlun2 (R200/R300) or Kunlun3 (P800), a different runtime stack (`xpytorch`) with no KL1 equivalent. |
+
+### Untested
+
+- `rmmod`/reload of the loaded module, and persistence across a reboot when installed via `scripts/install_driver.sh`/DKMS (only loaded by hand with `insmod` so far).
+- Loading under Secure Boot with a self-signed module (test host has Secure Boot off; the module is unsigned and taints the kernel on load).
+- gcc 14 specifically (built and verified with gcc 15.2 plus the wrapper below). gcc 13 fails outright on a 7.0 kernel build (`-fmin-function-alignment` is rejected).
+
+### Building
 
 ```bash
 sudo apt install build-essential linux-headers-$(uname -r)
@@ -181,41 +217,17 @@ modinfo -F vermagic ./kunlun.ko            # must match uname -r
 cd ..
 ```
 
-- Built with gcc 15.2 and the wrapper above; gcc 14 is untested. gcc 13 fails on a 7.0 kernel (it rejects `-fmin-function-alignment`).
-- To install, use `make driver-install-norebuild` (or `scripts/install_driver.sh`) on the `kunlun.ko` you just built. `make driver-install` depends on `make driver`, which would rebuild with the default `CC` and should fail the same way. Neither install path has been run on 7.0 yet.
-- Rebuild after every kernel upgrade; the `vermagic` must match `uname -r`.
-- **Load it by hand the first time** and read `dmesg` before installing it for boot:
-  `sudo insmod kunlun-driver/kunlun.ko kl1_p2p_stub=0 kl1_dma_direct=1 kl1_bounce_pipe=1`.
-  The module is unsigned, so Secure Boot blocks it and the kernel is tainted when it loads.
+- Rebuild after every kernel upgrade; `vermagic` must match `uname -r`.
+- To install, use `make driver-install-norebuild` (or `scripts/install_driver.sh`) on the `kunlun.ko` you just built — `make driver-install` depends on `make driver`, which rebuilds with the default `CC` and would fail the same way the stock tree does on 6.15+.
+- **Load it by hand the first time** and read `dmesg` before installing it for boot: `sudo insmod kunlun-driver/kunlun.ko kl1_p2p_stub=0 kl1_dma_direct=1 kl1_bounce_pipe=1`.
 
-What the changes do:
+What the kernel-7.0 patch does:
 
-- **Kbuild:** kernel 6.15+ ignores `EXTRA_CFLAGS`, so it is forwarded to `ccflags-y`. The conftest probe flags gain `-std=gnu11 -fms-extensions` (kernel 7.0 needs `-fms-extensions`; without it every probe that includes `pci.h` fails on a `sizeof(struct filename)` assertion and the driver takes old-kernel code paths). `-Wno-error=int-conversion` restores the pre-gcc-14 warning.
-- **API renames:** `in_irq` to `in_hardirq`; `del_timer` to `timer_delete`; `hrtimer_init` plus `.function` to `hrtimer_setup`; `nth_page(p, j)` to `p + j` (the pages come from one contiguous allocation); `follow_pfn` to `follow_pfnmap_start/end`.
-- **Stubs:** the "function is present" conftest probes are inverted and break on gcc 14+ (implicit declarations are errors), so `phys_to_dma` uses the plain address, `dma_is_direct` is assumed false, `dma_map_ops.map_resource` is treated as absent (the peer-DMA check returns false), and the console-lock and `jiffies_to_timespec` branches are disabled. `vm_flags_set`/`vm_flags_clear` are always used (`vm_flags` has been const since 6.3). These were written as untested guesses and are now confirmed correct by the workload result above — see the next section for what was actually run.
+- **Kbuild:** kernel 6.15+ ignores `EXTRA_CFLAGS`, so it's forwarded to `ccflags-y`. Conftest probe flags gain `-std=gnu11 -fms-extensions` (without `-fms-extensions`, every probe that includes `pci.h` fails a `sizeof(struct filename)` assertion and the driver silently falls back to old-kernel code paths). `-Wno-error=int-conversion` restores the pre-gcc-14 warning behavior.
+- **API renames:** `in_irq`→`in_hardirq`; `del_timer`→`timer_delete`; `hrtimer_init`+`.function`→`hrtimer_setup`; `nth_page(p, j)`→`p + j` (pages come from one contiguous allocation here); `follow_pfn`→`follow_pfnmap_start/end`.
+- **Stubs for gcc-14-broken probes:** the "function is present" conftest probes are inverted and break once implicit declarations are hard errors, so `phys_to_dma` uses the plain address, `dma_is_direct` is assumed false, `dma_map_ops.map_resource` is treated as absent (peer-DMA check returns false), and the console-lock/`jiffies_to_timespec` branches are disabled; `vm_flags_set`/`vm_flags_clear` are always used (`vm_flags` const since 6.3). Confirmed correct by the GEMM/DMA-correctness results above.
 
-### Software stacks tried on this build
-
-Two unrelated repo gaps had to be fixed before any of this would build at all, both now fixed in this tree:
-
-- **`xdnn-ubuntu_x86_64/so/libxpuapi.so` was a Git LFS pointer, not the real 650 MB library**, because nothing in this checkout had ever run `git lfs pull`. Run `git lfs install && git lfs pull` after cloning (`sudo apt install git-lfs` first if needed), or `make all` will link against a 134-byte text file.
-- **The `Makefile` hardcoded `-I/usr/local/xpu-4.33.0/include` / `-L/usr/local/xpu-4.33.0/lib64`** (XPURT) and `ROOT = /mnt/storage/test_xpu` (xdnn), so `make all` failed on any host that doesn't have the full XPURT SDK installed to that exact path. It now defaults `ROOT` to the checkout itself and finds `xpu/runtime.h` under `kunlun-driver/include` (the low-level XPURT header, bundled in this repo but not previously referenced by the Makefile) — no external SDK install is needed. Override `XPURT_INC`/`XDNN_INC`/`XDNN_LIB` to still build against a system install instead. The Makefile also creates the `libxpurt.so` → `libxpurt.so.1` symlink that `-lxpurt` needs (now also committed directly, so it's there even without running `make`).
-
-With those fixed, two different software paths were tried on top of the patched kernel-7.0 driver:
-
-- **Direct xdnn/XPURT programming (this repo's own benchmarks and tests): works correctly.** This is the basis for the workload result above — `test_host_alloc`, `test_pageable_verify`, and the full `xpu_perf_test` GEMM/bandwidth suite all ran and matched this README's documented numbers.
-- **The official `paddlepaddle-xpu` 2.6.1 pip wheel: installs and detects the card, but gives wrong results.** `paddle.device.xpu.device_count()` correctly returns 2, and `paddle.set_device("xpu:0")` succeeds, but a basic round-trip (`paddle.to_tensor(host_array).numpy()`) comes back all zeros with no error — not a crash, silently wrong data — and `paddle.randn(...)` raises `XDNN_INVALID_PARAM`. The cause is not this repo's driver: Paddle's wheel bundles its own `libxpuapi.so` (587 MB, built from a different source snapshot — `XDNN_VERSION_master-changed`, referencing newer kernels such as `page_attention` that don't exist in this repo's bundled 650 MB build), and that bundled library is the one failing, not the kernel module or the raw XPURT transfer path (confirmed separately: both are correct, see above). This matches a public report of Paddle release/2.5 "compiling but hanging at runtime" on K200 ([PaddlePaddle/Paddle#56781](https://github.com/PaddlePaddle/Paddle/issues/56781)) — same underlying story (Baidu's official Paddle builds don't reliably run on K200 at the compute-kernel level), different symptom (wrong values here vs. a hang there). **Not yet tried:** pointing Paddle at this repo's own `libxpuapi.so` via `LD_LIBRARY_PATH` instead of its bundled one, since the raw library is proven to work.
-- vLLM is not an option regardless of driver state: Baidu's `vllm-kunlun` plugin supports only the Kunlun3 (P800) generation and runs on a KL3-specific PyTorch build (`xpytorch`), which has no KL1 equivalent. An open feature request for K200 support ([baidu/vLLM-Kunlun#499](https://github.com/baidu/vLLM-Kunlun/issues/499)) has had no maintainer response.
-
-### Runtime knobs (`/sys/module/kunlun/parameters/`)
-
-| Param | Prod default | Notes |
-|-------|:------------:|-------|
-| `kl1_dma_direct` | 1 | S4 host_alloc direct EDMA |
-| `kl1_bounce_pipe` | 1 | S6 pageable double-buffer |
-| `kl1_pageable_pin` | **0** | keep off (4K pin hangs/slow on large xfers) |
-| `kl1_p2p_stub` | 0 | debug path off |
-| `kl1_bounce_d2h` | 1 | S9 default; no extra pageable D2H win |
+Two unrelated repo gaps had to be fixed before any of this would build at all (both already fixed in this tree — see [Environment](#environment)): `libxpuapi.so` left as an unfetched Git LFS pointer, and the `Makefile` hardcoding an external SDK path and a specific developer's machine path.
 
 ---
 
@@ -288,7 +300,7 @@ python3 scripts/paddle_infer_benchmark.py --model paddle_models --batch 1,8,32
 
 | Component | Path / note |
 |-----------|-------------|
-| XPURT (bundled) | `xdnn-ubuntu_x86_64/so/libxpurt.so.1`, built against by default — no system install required (see [Building on Linux 6.15 / 7.0](#building-on-linux-615--70-gcc-14)) |
+| XPURT (bundled) | `xdnn-ubuntu_x86_64/so/libxpurt.so.1`, built against by default — no system install required (see [Kernel 7.0 / modern host support](#kernel-70--modern-host-support)) |
 | XPURT (system install, optional) | `/usr/local/xpu-4.33.0/lib64/libxpurt.so.1`; override `XPURT_INC`/`XDNN_LIB` to use it instead |
 | Driver (installed) | `/lib/modules/$(uname -r)/updates/dkms/kunlun.ko` — never shipped prebuilt; `*.ko` is gitignored, so `make driver` (or the 6.15+/7.0 build) is required on every host |
 | xdnn | `xdnn-ubuntu_x86_64/` — `libxpuapi.so` is Git LFS; run `git lfs pull` after cloning |
