@@ -142,7 +142,7 @@ static inline NV_STATUS nv_sleep_us(unsigned int us)
     ktime_get_raw_ts64(&tm1);
 #endif
 
-    if (in_irq() && (us > NV_MAX_ISR_DELAY_US))
+    if (in_hardirq() && (us > NV_MAX_ISR_DELAY_US))
         return NV_ERR_GENERIC;
 
     mdelay_safe_msec = us / 1000;
@@ -187,7 +187,7 @@ static inline NV_STATUS nv_sleep_ms(unsigned int ms)
     tm_start = tm_aux;
 #endif
 
-    if (in_irq() && (ms > NV_MAX_ISR_DELAY_MS))
+    if (in_hardirq() && (ms > NV_MAX_ISR_DELAY_MS))
     {
         return NV_ERR_GENERIC;
     }

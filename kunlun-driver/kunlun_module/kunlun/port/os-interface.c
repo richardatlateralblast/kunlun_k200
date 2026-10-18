@@ -244,7 +244,7 @@ NvBool NV_API_CALL os_semaphore_may_sleep(void)
 
 NvBool NV_API_CALL os_is_isr(void)
 {
-    return (in_irq());
+    return (in_hardirq());
 }
 
 // return TRUE if the caller is the super-user
@@ -568,7 +568,7 @@ NvU64 NV_API_CALL os_get_current_tick_hr(void)
 
 NvU64 NV_API_CALL os_get_current_tick(void)
 {
-#if defined(NV_JIFFIES_TO_TIMESPEC_PRESENT)
+#if 0 /* jiffies_to_timespec removed */
     struct timespec ts;
     jiffies_to_timespec(jiffies, &ts);
     return (NvU64) timespec_to_ns(&ts);

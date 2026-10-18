@@ -277,7 +277,7 @@ static inline struct rw_semaphore *nv_mmap_get_lock(struct mm_struct *mm)
 
 static inline void nv_vm_flags_set(struct vm_area_struct *vma, vm_flags_t flags)
 {
-#if defined(NV_VM_AREA_STRUCT_HAS_CONST_VM_FLAGS)
+#if 1 /* vm_flags is const since 6.3 */
     vm_flags_set(vma, flags);
 #else
     vma->vm_flags |= flags;
@@ -286,7 +286,7 @@ static inline void nv_vm_flags_set(struct vm_area_struct *vma, vm_flags_t flags)
 
 static inline void nv_vm_flags_clear(struct vm_area_struct *vma, vm_flags_t flags)
 {
-#if defined(NV_VM_AREA_STRUCT_HAS_CONST_VM_FLAGS)
+#if 1 /* vm_flags is const since 6.3 */
     vm_flags_clear(vma, flags);
 #else
     vma->vm_flags &= ~flags;

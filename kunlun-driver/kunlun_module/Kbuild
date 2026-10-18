@@ -115,7 +115,7 @@ NV_CONFTEST_CMD := /bin/sh $(NV_CONFTEST_SCRIPT) \
 
 NV_CFLAGS_FROM_CONFTEST := $(shell $(NV_CONFTEST_CMD) build_cflags)
 
-NV_CONFTEST_CFLAGS = $(NV_CFLAGS_FROM_CONFTEST) $(EXTRA_CFLAGS) -fno-pie
+NV_CONFTEST_CFLAGS = $(NV_CFLAGS_FROM_CONFTEST) $(EXTRA_CFLAGS) -fno-pie -std=gnu11 -fms-extensions
 
 NV_CONFTEST_COMPILE_TEST_HEADERS := $(obj)/conftest/macros.h
 NV_CONFTEST_COMPILE_TEST_HEADERS += $(obj)/conftest/functions.h
@@ -206,3 +206,7 @@ $(BUILD_SANITY_CHECKS):
 $(NV_CONFTEST_HEADERS): | $(BUILD_SANITY_CHECKS)
 
 # vim: set ft=Makefile
+
+# kernel >= 6.15 ignores EXTRA_CFLAGS
+ccflags-y += $(EXTRA_CFLAGS)
+ccflags-y += -Wno-error=int-conversion

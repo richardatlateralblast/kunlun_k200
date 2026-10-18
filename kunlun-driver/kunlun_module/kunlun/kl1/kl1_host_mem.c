@@ -106,7 +106,7 @@ static int kl1_map_chunk(struct xpu_pd *xpd, struct vm_area_struct *vma,
     (*chunk_idx)++;
 
     for (j = 0; j < sub_pages; j++) {
-        ret = vm_insert_page(vma, *map_addr, nth_page(page, j));
+        ret = vm_insert_page(vma, *map_addr, (page + j));
         if (ret) {
             LOGW("[xpu_%d] vm_insert_page failed at 0x%lx order=%u ret=%d\n", xpd->devfile_id,
                  *map_addr, order, ret);

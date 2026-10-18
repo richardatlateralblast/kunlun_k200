@@ -681,7 +681,7 @@ static inline void register_timer(struct timer_list *timer, void (*handler)(unsi
                                   unsigned long interval, unsigned long data)
 {
     if (timer->function) {
-        del_timer(timer);
+        timer_delete(timer);
     }
     //timer->data     = data;
     //// interval should be ms, so interval/1000 is s

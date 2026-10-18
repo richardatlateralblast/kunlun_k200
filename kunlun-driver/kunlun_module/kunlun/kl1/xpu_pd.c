@@ -169,7 +169,7 @@ void xpd_init_ktimer(struct xpu_pd *xpd)
 
 void xpd_del_ktimer(struct xpu_pd *xpd)
 {
-    del_timer(&xpd->ktimer);
+    timer_delete(&xpd->ktimer);
 }
 
 int xpd_busy_tq_count(struct xpu_pd *xpd)

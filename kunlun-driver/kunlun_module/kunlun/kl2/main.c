@@ -109,12 +109,10 @@ int kl2_device_init(struct kl2_device *kl2_dev)
     }
 
     kl2_dev->ur_ktime = ktime_set(0, 1 * 1000 * 1000); // 1ms
-    hrtimer_init(&kl2_dev->ur_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-    kl2_dev->ur_timer.function = kl2_ur_update_stat_func;
+    hrtimer_setup(&kl2_dev->ur_timer, kl2_ur_update_stat_func, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
     kl2_dev->ur_timer_valid    = true;
     kl2_dev->regular_ktime     = ktime_set(0, 500 * 1000 * 1000); // 500ms
-    hrtimer_init(&kl2_dev->regular_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-    kl2_dev->regular_timer.function = kl2_regular_timer_func;
+    hrtimer_setup(&kl2_dev->regular_timer, kl2_regular_timer_func, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
     kl2_dev->regular_timer_valid    = true;
     kl2_dev->regular_timer_toggle   = true;
 

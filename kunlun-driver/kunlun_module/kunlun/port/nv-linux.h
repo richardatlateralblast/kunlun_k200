@@ -730,7 +730,7 @@ static inline void nv_vunmap(NvUPtr vaddr, NvU32 page_count)
 
 static inline dma_addr_t nv_phys_to_dma(struct device *dev, NvU64 pa)
 {
-#if defined(NV_PHYS_TO_DMA_PRESENT)
+#if 0 /* phys_to_dma is not available to modules on >=6.x */
     return phys_to_dma(dev, pa);
 #elif defined(NV_XEN_SUPPORT_FULLY_VIRTUALIZED_KERNEL)
     return phys_to_machine(pa);
@@ -912,7 +912,7 @@ typedef void irqreturn_t;
  * Early 2.6 kernels have acquire_console_sem, but from 2.6.38+ it was
  * renamed to console_lock.
  */
-#if defined(NV_ACQUIRE_CONSOLE_SEM_PRESENT)
+#if 0 /* acquire_console_sem long gone */
 #define NV_ACQUIRE_CONSOLE_SEM() acquire_console_sem()
 #define NV_RELEASE_CONSOLE_SEM() release_console_sem()
 #elif defined(NV_CONSOLE_LOCK_PRESENT)
@@ -1229,7 +1229,7 @@ static inline NvBool nv_is_dma_direct(struct device *dev)
 {
     NvBool is_direct = NV_FALSE;
 
-#if defined(NV_DMA_IS_DIRECT_PRESENT)
+#if 0 /* dma_is_direct removed */
     if (dma_is_direct(get_dma_ops(dev)))
         is_direct = NV_TRUE;
 #endif

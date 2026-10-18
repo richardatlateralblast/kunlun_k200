@@ -787,7 +787,7 @@ static NvBool nv_dma_is_map_resource_implemented
 #endif
     }
 
-    return (ops->map_resource != NULL);
+    return NV_FALSE; /* dma_map_ops.map_resource removed from the kernel */
 #else
     return NV_FALSE;
 #endif

@@ -310,8 +310,7 @@ int kl2_video_perf_init(struct kl2_device *kl2_dev)
     atomic_set(&image_proc->video_perf->frames_num, 0);
     atomic_set(&image_proc->video_perf->last_frames_num, 0);
 
-    hrtimer_init(&kl2_dev->video_perf_hrtimer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-    kl2_dev->video_perf_hrtimer.function = do_video_perf;
+    hrtimer_setup(&kl2_dev->video_perf_hrtimer, do_video_perf, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
     hrtimer_start(&kl2_dev->video_perf_hrtimer, SAMPLING_INTERVAL, HRTIMER_MODE_REL);
 
     return 0;
