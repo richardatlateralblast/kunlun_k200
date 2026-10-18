@@ -50,3 +50,4 @@ docs/research/*_readiness.log
 kunlun.ko.patched.save
 **/kunlun.ko.bak*
 docs/private/
+CLAUDE.md
