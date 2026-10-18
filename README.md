@@ -18,6 +18,18 @@ Same host also tracks **Intel Xeon Phi 7220P (KNL)** bring-up and co-located AMD
 
 **Privacy:** Public docs must not include hostnames, absolute home/lab paths, full `lspci`/dmesg dumps, BMC details, or device serial numbers. Use PCI **IDs** and relative repo paths only.
 
+### Quickstart
+
+```bash
+git clone <this repo> && cd kunlun_k200
+git lfs install && git lfs pull   # fetches libxpuapi.so (~650 MB) and other large files
+make all                          # builds benchmarks/ and tests/ against the bundled xdnn SDK — no external install needed
+./tests/test_host_alloc && ./tests/test_pageable_verify   # correctness check
+./benchmarks/xpu_perf_test 0      # full GEMM + bandwidth suite
+```
+
+This assumes the kernel driver is already loaded (`lsmod | grep kunlun`). If not, or if you're on kernel 6.15+ (including 7.0), build and load it first — see [Install](#install) and [Building on Linux 6.15 / 7.0](#building-on-linux-615--70-gcc-14). **The built `kunlun.ko` is never committed** (`*.ko` is gitignored, like every compiled binary in this repo); there's no prebuilt module to download, so this build step is mandatory, not optional, for every kernel version including the ones this driver originally targeted.
+
 ### Live driver check (K200)
 
 ```bash
@@ -278,7 +290,7 @@ python3 scripts/paddle_infer_benchmark.py --model paddle_models --batch 1,8,32
 |-----------|-------------|
 | XPURT (bundled) | `xdnn-ubuntu_x86_64/so/libxpurt.so.1`, built against by default — no system install required (see [Building on Linux 6.15 / 7.0](#building-on-linux-615--70-gcc-14)) |
 | XPURT (system install, optional) | `/usr/local/xpu-4.33.0/lib64/libxpurt.so.1`; override `XPURT_INC`/`XDNN_LIB` to use it instead |
-| Driver (installed) | `/lib/modules/$(uname -r)/updates/dkms/kunlun.ko` |
+| Driver (installed) | `/lib/modules/$(uname -r)/updates/dkms/kunlun.ko` — never shipped prebuilt; `*.ko` is gitignored, so `make driver` (or the 6.15+/7.0 build) is required on every host |
 | xdnn | `xdnn-ubuntu_x86_64/` — `libxpuapi.so` is Git LFS; run `git lfs pull` after cloning |
 
 ---
