@@ -125,7 +125,7 @@ Legend: ✅ confirmed working · ❌ confirmed broken · 🚫 confirmed unsuppor
 | Bare compute/RNG coprocessor (direct xdnn/XPURT calls, no framework) | ✅ | What this repo's own benchmarks/tests already do — lowest-risk path for anything new |
 | K-means clustering | ⚠️ | Every needed primitive present and ungated (GEMM, `argmin`, one-hot trick for centroid update); untested end-to-end |
 | CTR / ranking / recommendation (GRNN/DSSM/Wide&Deep-style) | ⚠️ | Looks like this card's original intended workload; untested on real weights |
-| Classic object detection (YOLO-class via `yolo_unit_fusion`) | ⚠️ | Same envelope as proven CNN cases; untested |
+| Classic object detection (YOLO-class via `yolo_unit_fusion`) | 🚫 | **Tested directly, confirmed broken on xpu1**: dispatch correctly reaches `api::kXPU1` but hits an internal `[ASSERT-FAIL]` in Baidu's own wrapper source, immediately and regardless of parameters tried. `resnet_unit_fusion` hits the identical pattern. Both `*_unit_fusion` convenience wrappers are unimplemented for K100/K200 despite having flat, non-namespaced xpu1 symbols — a real example of this repo's own "symbol exists ≠ runtime support" caveat. Plain `conv2d_fusion` (used by this repo's own proven CNN cases) is unaffected. See `RESEARCH.md` |
 | Classic (non-VL) OCR inference, pretrained (CRNN: conv+RNN+softmax) | ⚠️ | Inference looks feasible; **training** blocked (`ctc_loss_bwd` is gen-gated) |
 | BERT/ERNIE-era encoder inference (hand-composed, unfused attention) | ⚠️ | GEMM+softmax+layer_norm all present; not confirmed end to end |
 | Graph neural networks (message passing) | 🚫 | `index_add`/scatter-add is gen-gated (`xpu2::`/`xpu3::` only); no SpMM anywhere in this SDK regardless of generation |
