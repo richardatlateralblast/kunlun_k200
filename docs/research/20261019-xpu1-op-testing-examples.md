@@ -204,3 +204,67 @@ int main() {
 ```
 
 **If you run this and it faults**: `dmesg | tail` will show `kunlun: [WARN] xpu0: sse exception`/`xpu0 xtqN: task fifo overflow`. A module hot-reload (`scripts/install_driver.sh`) is **not sufficient** to recover — expect the next GEMM benchmark run to hang for several minutes and then report `OOM`. A full `sudo reboot` is required to restore the device to its normal, verified-healthy state.
+
+## 4. `lstm_inference` — confirmed working
+
+**Status: dispatches, computes correctly, leaves the device healthy.** Unlike `grnn_cell`, no reverse-engineering was needed — the plain (non-templated, non-quantized) overload in `xpu/refactor/fusion.h` has a fully commented signature, each parameter annotated with its exact PaddlePaddle fluid variable-name correspondence.
+
+```cpp
+#include "xpu/xdnn.h"
+#include <cstdio>
+#include <vector>
+namespace xdnn = baidu::xpu::api;
+
+static float* dev_buf(const std::vector<float>& h) {
+    float* d = nullptr;
+    xpu_malloc((void**)&d, h.size() * sizeof(float));
+    xpu_memcpy(d, h.data(), h.size() * sizeof(float), XPUMemcpyKind::XPU_HOST_TO_DEVICE);
+    return d;
+}
+
+int main() {
+    xpu_set_device(0);
+    auto* ctx = xdnn::create_context();
+    const int64_t batch_size = 1, seq_len = 2, xdim = 2, hdim = 2;
+
+    std::vector<float> h_x = {0.1f, 0.2f, 0.3f, 0.4f};          // [batch, seq, xdim]
+    std::vector<float> h_wx(4 * hdim * xdim), h_wh(4 * hdim * hdim);
+    for (int64_t i = 0; i < (int64_t)h_wx.size(); i++) h_wx[i] = 0.05f * (float)((i % 5) - 2);
+    for (int64_t i = 0; i < (int64_t)h_wh.size(); i++) h_wh[i] = 0.05f * (float)((i % 5) - 2);
+    std::vector<float> h_bx(4 * hdim, 0.0f), h_bh(4 * hdim, 0.0f);
+
+    float* d_x = dev_buf(h_x);
+    float* d_wx = dev_buf(h_wx), *d_wh = dev_buf(h_wh);
+    float* d_bx = dev_buf(h_bx), *d_bh = dev_buf(h_bh);
+    float* d_last_h = nullptr; xpu_malloc((void**)&d_last_h, batch_size * hdim * sizeof(float));
+
+    int64_t h_seq_len[1] = {seq_len};
+    int64_t* d_seq_len = nullptr;
+    xpu_malloc((void**)&d_seq_len, sizeof(h_seq_len));
+    xpu_memcpy(d_seq_len, h_seq_len, sizeof(h_seq_len), XPUMemcpyKind::XPU_HOST_TO_DEVICE);
+
+    // init_h/init_c both nullptr is the documented convention (see the
+    // header comment next to each param); no reverse-engineering needed,
+    // unlike grnn_cell above.
+    int ret = xdnn::lstm_inference(ctx,
+        d_x, /*x_need_transpose=*/true,
+        /*init_h=*/nullptr, /*init_c=*/nullptr,
+        d_seq_len,
+        d_wx, /*wx_maxptr=*/nullptr,
+        d_wh, /*wh_maxptr=*/nullptr,
+        d_bx, d_bh,
+        d_last_h,
+        batch_size, seq_len, xdim, hdim);
+    printf("lstm_inference ret=%d\n", ret);
+    printf("xpu_wait ret=%d\n", xpu_wait());
+
+    std::vector<float> h_last_h(batch_size * hdim);
+    xpu_memcpy(h_last_h.data(), d_last_h, h_last_h.size() * sizeof(float), XPUMemcpyKind::XPU_DEVICE_TO_HOST);
+    printf("last_h: %.6f %.6f\n", h_last_h[0], h_last_h[1]);  // tanh-bounded: must be in [-1,1]
+    return ret;
+}
+```
+
+Run twice in a row: output is exactly reproducible (`0.016579 -0.015127` both times), both values correctly within `[-1,1]` (an LSTM hidden state is always tanh-bounded), `dmesg` logs nothing at all (not even the benign `host_alloc` INFO lines larger tests produce), and the full `xpu_perf_test` GEMM suite run immediately after matches the established baseline exactly — no device degradation, unlike `grnn_cell`. With `XPUAPI_DEBUG=1`, the trace shows a real decomposition (`gtest_transpose` → `gtest_cast`/`gtest_copy` → `gtest_lstm_train<float,float,int16_t>(api::kXPU1, ...)`), confirming this isn't a stub either — it's genuinely computing on the chip.
+
+**Still untested**: `bilstm_inference` (the actual bidirectional variant a real CRNN needs) and realistic dimensions (this used toy `hdim=2`/`seq_len=2`/`batch_size=1`).
