@@ -268,3 +268,72 @@ int main() {
 Run twice in a row: output is exactly reproducible (`0.016579 -0.015127` both times), both values correctly within `[-1,1]` (an LSTM hidden state is always tanh-bounded), `dmesg` logs nothing at all (not even the benign `host_alloc` INFO lines larger tests produce), and the full `xpu_perf_test` GEMM suite run immediately after matches the established baseline exactly — no device degradation, unlike `grnn_cell`. With `XPUAPI_DEBUG=1`, the trace shows a real decomposition (`gtest_transpose` → `gtest_cast`/`gtest_copy` → `gtest_lstm_train<float,float,int16_t>(api::kXPU1, ...)`), confirming this isn't a stub either — it's genuinely computing on the chip.
 
 **Still untested**: `bilstm_inference` (the actual bidirectional variant a real CRNN needs) and realistic dimensions (this used toy `hdim=2`/`seq_len=2`/`batch_size=1`).
+
+## 5. `bilstm_inference` — confirmed working
+
+**Status: dispatches, computes correctly, leaves the device healthy — same clean outcome as `lstm_inference` above.** Uses `baidu::xpu::api::bilstm_inference<float,float,short>` (a real compiled instantiation, confirmed via `nm -D`), the actual bidirectional variant a real CRNN uses. Forward and backward weight sets are reused from the same values here for simplicity — this is a dispatch/correctness-shape smoke test, not a trained model.
+
+```cpp
+#include "xpu/xdnn.h"
+#include <cstdio>
+#include <vector>
+namespace xdnn = baidu::xpu::api;
+
+static float* dev_buf(const std::vector<float>& h) {
+    float* d = nullptr;
+    xpu_malloc((void**)&d, h.size() * sizeof(float));
+    xpu_memcpy(d, h.data(), h.size() * sizeof(float), XPUMemcpyKind::XPU_HOST_TO_DEVICE);
+    return d;
+}
+static float* dev_zeros(int64_t n) { float* d = nullptr; xpu_malloc((void**)&d, n * sizeof(float)); return d; }
+
+int main() {
+    xpu_set_device(0);
+    auto* ctx = xdnn::create_context();
+    const int64_t batch_size = 1, seq_len = 2, xdim = 2, hdim = 2, layer_num = 1;
+
+    std::vector<float> h_x = {0.1f, 0.2f, 0.3f, 0.4f};
+    std::vector<float> h_wx(4 * hdim * xdim), h_wh(4 * hdim * hdim);
+    for (int64_t i = 0; i < (int64_t)h_wx.size(); i++) h_wx[i] = 0.05f * (float)((i % 5) - 2);
+    for (int64_t i = 0; i < (int64_t)h_wh.size(); i++) h_wh[i] = 0.05f * (float)((i % 5) - 2);
+    std::vector<float> h_bx(4 * hdim, 0.0f), h_bh(4 * hdim, 0.0f);
+
+    float* d_x = dev_buf(h_x);
+    float* d_fwd_wx = dev_buf(h_wx), *d_fwd_wh = dev_buf(h_wh);
+    float* d_fwd_bx = dev_buf(h_bx), *d_fwd_bh = dev_buf(h_bh);
+    float* d_bwd_wx = dev_buf(h_wx), *d_bwd_wh = dev_buf(h_wh);
+    float* d_bwd_bx = dev_buf(h_bx), *d_bwd_bh = dev_buf(h_bh);
+
+    // Output shapes aren't spelled out in a header comment for this overload
+    // (unlike plain lstm_inference); allocate generously.
+    float* d_y = dev_zeros(seq_len * batch_size * 2 * hdim);
+    float* d_last_h = dev_zeros(2 * batch_size * hdim);
+    float* d_last_c = dev_zeros(2 * batch_size * hdim);
+    std::vector<int64_t> seq_len_tensor = {seq_len};
+
+    int ret = xdnn::bilstm_inference<float, float, short>(ctx,
+        d_x, /*init_h=*/nullptr, /*init_c=*/nullptr,
+        d_fwd_wx, d_fwd_wh, d_fwd_bx, d_fwd_bh,
+        d_bwd_wx, d_bwd_wh, d_bwd_bx, d_bwd_bh,
+        d_y, d_last_h, d_last_c,
+        batch_size, xdim, hdim, seq_len, seq_len_tensor, layer_num,
+        /*x_maxptr=*/nullptr, /*h_maxptr=*/nullptr,
+        /*forward_wx_maxptr=*/nullptr, /*forward_wh_maxptr=*/nullptr,
+        /*backward_wx_maxptr=*/nullptr, /*backward_wh_maxptr=*/nullptr,
+        xdnn::Activation_t::TANH, xdnn::Activation_t::SIGMOID);  // documented default elsewhere in fusion.h
+
+    printf("bilstm_inference ret=%d\n", ret);
+    printf("xpu_wait ret=%d\n", xpu_wait());
+
+    std::vector<float> h_last_h(2 * batch_size * hdim);
+    xpu_memcpy(h_last_h.data(), d_last_h, h_last_h.size() * sizeof(float), XPUMemcpyKind::XPU_DEVICE_TO_HOST);
+    printf("last_h: %.6f %.6f %.6f %.6f\n", h_last_h[0], h_last_h[1], h_last_h[2], h_last_h[3]);
+    return ret;
+}
+```
+
+Run twice: output is exactly reproducible, all four values correctly within `[-1,1]`, `dmesg` logs nothing at all, and the full `xpu_perf_test` GEMM suite run immediately after matches the established baseline. With `XPUAPI_DEBUG=1`, the trace shows a real decomposition — `gtest_bilstm_inference` → `gtest_bilstm_train` (forward pass, backward pass) → `gtest_concat` to join the two directions — confirming genuine, non-stub computation.
+
+**Correctness cross-check**: the forward-direction half of this output (`0.016579 -0.015127`) exactly matches example 4's standalone `lstm_inference` result above, since both tests used identical weights and input — internal consistency between the two APIs, not just "didn't crash."
+
+With this, both the unidirectional and bidirectional LSTM a real CRNN needs are confirmed working. **Still untested**: realistic (larger, batched) dimensions — both this test and example 4 used toy shapes.
