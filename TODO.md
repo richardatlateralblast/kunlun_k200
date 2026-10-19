@@ -6,7 +6,7 @@ See `RESEARCH.md` for the findings behind these items (K200-on-modern-host work)
 
 ## Open
 
-Nothing currently — see "Later (non-essential)" below for deprioritized items.
+- [~] Get a hand-written xpu1 cluster kernel actually executing on real K200 hardware (2026-10-19 progress: compiles cleanly with the real XTDK compiler, links, runs through launch with no errors — but `xpu_wait()` doesn't return. Leading hypothesis: missing `baidu::xpu::api::Context` initialization that raw XPURT calls skip; testing that is blocked on a separate, unresolved `__float128`/libstdc++ toolchain issue — see `RESEARCH.md` "Custom xpu1 kernel proof-of-concept" and `docs/research/20261019-xpu1-custom-kernel-poc.md`).
 
 ## Later (non-essential)
 

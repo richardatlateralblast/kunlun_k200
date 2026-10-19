@@ -130,7 +130,7 @@ Legend: ✅ confirmed working · ❌ confirmed broken · 🚫 confirmed unsuppor
 | BERT/ERNIE-era encoder inference (hand-composed, unfused attention) | ⚠️ | GEMM+softmax+layer_norm all present; not confirmed end to end |
 | Graph neural networks (message passing) | 🚫 | `index_add`/scatter-add is gen-gated (`xpu2::`/`xpu3::` only); no SpMM anywhere in this SDK regardless of generation |
 | LLM transformer serving (RoPE/SwiGLU/RMSNorm/paged-attention) | 🚫 | Not implemented for xpu1 in this repo's `libxpuapi.so` at all (gen-gated to `xpu2::`/`xpu3::`); present-but-undispatched in the Paddle wheel's own build (see above) |
-| Custom `ggml`/llama.cpp backend via hand-written cluster kernels | ⚠️ | Compiler-availability blocker cleared — Baidu's XTDK (LLVM 15-based) is confirmed publicly downloadable, unauthenticated, version pinned in this repo's own bundled SDK scripts. The actual kernel-writing work (RMSNorm/RoPE/SwiGLU/attention from scratch) is untouched and substantial — see `RESEARCH.md` |
+| Custom `ggml`/llama.cpp backend via hand-written cluster kernels | ⚠️ | A real hand-written xpu1 kernel (not SDK-provided) compiles cleanly with the real XTDK compiler and runs through launch with no errors on real hardware — but doesn't complete (`xpu_wait()` doesn't return; likely missing `Context` initialization a raw-XPURT launch skips, untested pending a separate toolchain fix). See `RESEARCH.md` and `docs/research/20261019-xpu1-custom-kernel-poc.md` |
 
 **Maintenance:** this table should be updated in the same change as any work that confirms, breaks, or newly tests one of these capabilities — see `CLAUDE.md`'s per-change checklist.
 
