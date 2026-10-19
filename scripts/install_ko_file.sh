@@ -7,6 +7,7 @@ KVER="$(uname -r)"
 DST="/lib/modules/${KVER}/updates/dkms/kunlun.ko"
 [[ "$(id -u)" -eq 0 ]] || { echo "run with sudo"; exit 1; }
 [[ -f "$SRC" ]] || { echo "missing $SRC"; exit 1; }
+mkdir -p "$(dirname "$DST")"
 cp -a "$SRC" "$DST"
 depmod -a
 echo "Installed $SRC -> $DST"

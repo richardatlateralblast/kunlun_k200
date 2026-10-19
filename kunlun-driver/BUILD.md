@@ -72,14 +72,27 @@ sudo modprobe kunlun kl1_p2p_stub=0 kl1_dma_direct=1 kl1_bounce_pipe=1
 
 ### Kernel upgrade
 
-After `uname -r` changes (e.g. 6.8.0-124 → 6.8.0-136), always:
+`scripts/install_driver.sh` is **not** real DKMS (see "Real DKMS alternative" below) — after `uname -r` changes (e.g. 6.8.0-124 → 6.8.0-136), it needs a manual rerun:
 
 ```bash
 make driver          # rebuild for new headers/vermagic
 sudo scripts/install_driver.sh
 ```
 
-Stock DKMS may load a **non-patched** module at boot (`srcversion` ≠ repo). Check before benchmarks.
+Stock DKMS may load a **non-patched** module at boot (`srcversion` ≠ repo) if a vendor install was ever registered separately from this repo's scripts. Check before benchmarks.
+
+### Real DKMS alternative: `install_driver_dkms.sh`
+
+`scripts/install_driver.sh` hand-copies a locally built `.ko` — nothing rebuilds it automatically on a kernel upgrade. `scripts/install_driver_dkms.sh` instead registers the driver with real DKMS (`kunlun-driver/dkms.conf`, builds from the **committed** tree via `git archive HEAD`, not the working tree), so `apt`'s kernel-postinst hook (`dkms_autoinstaller`) rebuilds and reinstalls it automatically on the next kernel bump — no manual rerun needed:
+
+```bash
+sudo KL1_P2P_STUB=0 KL1_DMA_DIRECT=1 KL1_BOUNCE_PIPE=1 AUTO_INSTALL_DKMS=1 \
+  scripts/install_driver_dkms.sh
+# or: make driver-install-dkms AUTO_INSTALL_DKMS=1
+sudo dkms status   # confirm: kunlun-module-dkms/<version>, <kver>, x86_64: installed
+```
+
+It removes any prior registration under the same package name/version first (including a stale one from its own earlier run, or a vendor install pointing at different, unpatched source), so the registered build always matches this repo. Needs the `dkms` package; pass `AUTO_INSTALL_DKMS=1` to let the script `apt-get install` it itself, or install it yourself first. Same env vars, same `/etc/modprobe.d/kunlun-kl1.conf` output, same unload/reload safety behavior as `install_driver.sh`. Confirmed (2026-10-19): registers, builds, installs, loads, passes the pattern tests, and survives a reboot; an actual kernel-version upgrade hasn't been exercised yet.
 
 ## Verify
 

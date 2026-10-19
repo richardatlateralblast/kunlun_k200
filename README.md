@@ -146,20 +146,36 @@ App defaults: `xpu_host_alloc` staging, **FP16** + `ncluster=4`, GEMM K ∈ [102
 
 ### Install
 
-Script **writes `.ko` to disk first**, then unload/reload. If unload sticks on *Unloading*, **reboot once** (patched image is already on disk).
+Two install scripts, same safety design (write `.ko`/register to disk first, then unload/reload; if unload sticks on *Unloading*, **reboot once** — the patched image is already on disk) but different durability:
+
+| | `install_driver.sh` (manual) | `install_driver_dkms.sh` (real DKMS) |
+|---|---|---|
+| Installs from | a locally built `kunlun-driver/kunlun.ko` (run `make driver` first) | the committed `kunlun-driver/` tree at `HEAD` (via `git archive`; commit driver changes first) |
+| Survives a reboot | yes | yes |
+| Survives a **kernel upgrade** | **no** — rerun `make driver && make driver-install` by hand after every kernel bump | **yes** — registered with real DKMS (`dkms.conf`'s `AUTOINSTALL=yes`), so `apt`'s kernel-postinst hook auto-rebuilds and reinstalls it |
+| Needs | nothing extra | the `dkms` package (`AUTO_INSTALL_DKMS=1` to let the script install it itself) |
 
 ```bash
+# Manual path (no kernel-upgrade auto-rebuild):
 make driver    # required after kernel package upgrade (vermagic must match uname -r)
 sudo KL1_P2P_STUB=0 KL1_DMA_DIRECT=1 KL1_BOUNCE_PIPE=1 scripts/install_driver.sh
 # or: make driver-install
 # disk only (then reboot): sudo DISK_ONLY=1 scripts/install_driver.sh && sudo reboot
 # install existing .ko without rebuild: make driver-install-norebuild
 # install arbitrary path: make install-ko KO=/path/to/kunlun.ko
+
+# Real-DKMS path (survives a kernel upgrade):
+sudo KL1_P2P_STUB=0 KL1_DMA_DIRECT=1 KL1_BOUNCE_PIPE=1 AUTO_INSTALL_DKMS=1 scripts/install_driver_dkms.sh
+# or: make driver-install-dkms AUTO_INSTALL_DKMS=1
+# check registration any time: sudo dkms status
+
 modinfo -F srcversion,vermagic kunlun
 make regression
 ```
 
-Boot-time options: `/etc/modprobe.d/kunlun-kl1.conf` (maintained by `install_driver.sh`).  
+Both scripts take the same `KL1_P2P_STUB`/`KL1_DMA_DIRECT`/`KL1_BOUNCE_PIPE`/`DISK_ONLY`/`SKIP_MODPROBE_CONF` env vars and write the same `/etc/modprobe.d/kunlun-kl1.conf`. `install_driver_dkms.sh` additionally compresses the installed module on distros that do so by default (e.g. Ubuntu → `kunlun.ko.zst`) — this is handled transparently.
+
+Boot-time options: `/etc/modprobe.d/kunlun-kl1.conf` (maintained by either script).  
 Details: [`kunlun-driver/BUILD.md`](kunlun-driver/BUILD.md), closure §4.
 
 ### Runtime knobs (`/sys/module/kunlun/parameters/`)
@@ -197,7 +213,7 @@ The S0–S9 work above targeted kernel 6.8. This section covers building and run
 
 ### Untested
 
-- `rmmod`/reload of the loaded module, and persistence across a reboot when installed via `scripts/install_driver.sh`/DKMS (only loaded by hand with `insmod` so far).
+- Surviving a kernel **upgrade** via `scripts/install_driver_dkms.sh`'s real-DKMS registration (reboot survival for both install scripts is confirmed — see the table in "Install" above; an actual kernel-version bump hasn't been tried).
 - Loading under Secure Boot with a self-signed module (test host has Secure Boot off; the module is unsigned and taints the kernel on load).
 - gcc 14 specifically (built and verified with gcc 15.2 plus the wrapper below). gcc 13 fails outright on a 7.0 kernel build (`-fmin-function-alignment` is rejected).
 
@@ -238,7 +254,9 @@ Two unrelated repo gaps had to be fixed before any of this would build at all (b
 ├── benchmarks/                 # xpu_perf_test, app_pipeline, denoise, p2p pipeline, int8 probe
 ├── tests/                      # p2p / host_alloc / pageable verify
 ├── scripts/
-│   ├── install_driver.sh       # robust install (disk-first, DISK_ONLY, modprobe.d)
+│   ├── install_driver.sh       # manual install (disk-first, DISK_ONLY, modprobe.d) — no kernel-upgrade auto-rebuild
+│   ├── install_driver_dkms.sh  # same, via real DKMS — survives a kernel upgrade (auto-rebuild)
+│   ├── lib_driver_common.sh    # shared load/unload/verify functions for the two scripts above
 │   ├── install_ko_file.sh
 │   ├── run_driver_regression.sh
 │   ├── run_real_cases.sh / run_demo.sh / run_c1…c5_*.sh

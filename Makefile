@@ -70,6 +70,17 @@ driver-install-norebuild:
 		DISK_ONLY=$${DISK_ONLY:-0} \
 		scripts/install_driver.sh
 
+# Register/build/install via real DKMS instead (survives a kernel upgrade —
+# see scripts/install_driver_dkms.sh). Builds from the committed tree (HEAD),
+# not the working tree, so commit driver changes first.
+driver-install-dkms:
+	sudo KL1_P2P_STUB=$${KL1_P2P_STUB:-0} \
+		KL1_DMA_DIRECT=$${KL1_DMA_DIRECT:-1} \
+		KL1_BOUNCE_PIPE=$${KL1_BOUNCE_PIPE:-1} \
+		DISK_ONLY=$${DISK_ONLY:-0} \
+		AUTO_INSTALL_DKMS=$${AUTO_INSTALL_DKMS:-0} \
+		scripts/install_driver_dkms.sh
+
 # Install arbitrary .ko to DKMS path only (no rebuild, no unload).
 # Example restore stock: make install-ko KO=/path/to/stock.ko
 install-ko:
