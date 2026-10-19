@@ -1,8 +1,8 @@
 # K100/K200 real-hardware op testing: usage examples
 
-Companion to `RESEARCH.md`'s "Hand-composed BERT/ERNIE-style attention", "`*_unit_fusion` convenience wrappers", and "`grnn_cell`" sections (all 2026-10-19). Each program below is self-contained, builds with plain `g++` (no XTDK needed — these call into the already-compiled `libxpuapi.so`, they don't write new device kernels), and was actually run against real K200 hardware to produce the results those sections describe.
+Companion to `RESEARCH.md`'s "Hand-composed BERT/ERNIE-style attention", "`*_unit_fusion` convenience wrappers", "`grnn_cell`", "`lstm_inference`"/"`bilstm_inference`", and "Hand-composed YOLO-style conv unit" sections (all 2026-10-19). Each program below is self-contained, builds with plain `g++` (no XTDK needed — these call into the already-compiled `libxpuapi.so`, they don't write new device kernels), and was actually run against real K200 hardware to produce the results those sections describe.
 
-Build pattern, same for all three:
+Build pattern, same for all six:
 
 ```bash
 g++ -std=c++17 -O2 \
@@ -337,3 +337,94 @@ Run twice: output is exactly reproducible, all four values correctly within `[-1
 **Correctness cross-check**: the forward-direction half of this output (`0.016579 -0.015127`) exactly matches example 4's standalone `lstm_inference` result above, since both tests used identical weights and input — internal consistency between the two APIs, not just "didn't crash."
 
 With this, both the unidirectional and bidirectional LSTM a real CRNN needs are confirmed working. **Still untested**: realistic (larger, batched) dimensions — both this test and example 4 used toy shapes.
+
+## 6. Hand-composed YOLO-style conv unit — working example
+
+**Status: confirmed numerically correct.** Direct hand-composed equivalent of a YOLO conv block, built the same way example 1's attention block was: individually-proven primitives standing in for a broken convenience wrapper (`yolo_unit_fusion`, example 2 above). `conv2d_fusion` → `batch_norm` → `leaky_relu`, with FP16 activations and `TGEMM=signed char` — the exact dtype combination this repo's own `benchmarks/xpu_denoise.cpp` already proves works; an all-`float` instantiation of `conv2d_fusion` hits a clean `XDNN_UNIMPLEMENTED` on xpu1 first, so don't reach for that by default.
+
+```cpp
+#include "xpu/xdnn.h"
+#include <cstdio>
+#include <cmath>
+#include <vector>
+
+namespace xdnn = baidu::xpu::api;
+
+static float16* dev_buf16(const std::vector<float>& h) {
+    std::vector<float16> h16(h.size());
+    for (size_t i = 0; i < h.size(); i++) h16[i] = float16(h[i]);
+    float16* d = nullptr;
+    xpu_malloc((void**)&d, h16.size() * sizeof(float16));
+    xpu_memcpy(d, h16.data(), h16.size() * sizeof(float16), XPUMemcpyKind::XPU_HOST_TO_DEVICE);
+    return d;
+}
+static float* dev_buf32(const std::vector<float>& h) {
+    float* d = nullptr;
+    xpu_malloc((void**)&d, h.size() * sizeof(float));
+    xpu_memcpy(d, h.data(), h.size() * sizeof(float), XPUMemcpyKind::XPU_HOST_TO_DEVICE);
+    return d;
+}
+
+int main() {
+    xpu_set_device(0);
+    auto* ctx = xdnn::create_context();
+
+    const int64_t N = 1, C = 3, H = 8, W = 8, F = 4, KS = 3;
+    const int64_t out_sz = N * F * H * W;
+
+    std::vector<float> h_x(N * C * H * W), h_w(F * C * KS * KS), h_bias(F, 0.0f);
+    for (int64_t i = 0; i < (int64_t)h_x.size(); i++) h_x[i] = 0.1f * (float)((i % 5) - 2);
+    for (int64_t i = 0; i < (int64_t)h_w.size(); i++) h_w[i] = 0.05f * (float)((i % 7) - 3);
+
+    float16* d_x = dev_buf16(h_x);
+    float16* d_w = dev_buf16(h_w);
+    float* d_bias = dev_buf32(h_bias);
+    float16* d_conv = nullptr; xpu_malloc((void**)&d_conv, out_sz * sizeof(float16));
+
+    // conv2d_fusion: raw conv + bias, Activation_t::LINEAR -- BN needs to
+    // sit between conv and the real activation, so no fused activation here.
+    int ret = xdnn::conv2d_fusion<float16, float16, float16, signed char>(
+        ctx, d_x, d_w, d_conv, N, C, H, W, F, {KS, KS}, {1, 1}, {1, 1}, {1, 1},
+        /*group=*/1, nullptr, nullptr, nullptr, /*is_nchw=*/true, d_bias,
+        /*branch=*/nullptr, xdnn::Activation_t::LINEAR);
+    printf("conv2d_fusion ret=%d\n", ret);
+
+    // batch_norm<float16> is XDNN_UNIMPLEMENTED on xpu1 -- cast to fp32,
+    // matching the usual practice of computing BN statistics in fp32 even
+    // in an otherwise-fp16 model, then cast back for the activation.
+    float* d_conv32 = nullptr; xpu_malloc((void**)&d_conv32, out_sz * sizeof(float));
+    xdnn::cast<float16, float>(ctx, d_conv, d_conv32, out_sz);
+
+    std::vector<float> h_scale(F), h_bn_bias(F);
+    for (int64_t i = 0; i < F; i++) { h_scale[i] = 1.0f + 0.1f * (float)i; h_bn_bias[i] = 0.05f * (float)i; }
+    float* d_scale = dev_buf32(h_scale), *d_bn_bias = dev_buf32(h_bn_bias);
+    float *d_bm = nullptr, *d_bis = nullptr, *d_gmean = nullptr, *d_gvar = nullptr;
+    xpu_malloc((void**)&d_bm, F * sizeof(float));
+    xpu_malloc((void**)&d_bis, F * sizeof(float));
+    xpu_malloc((void**)&d_gmean, F * sizeof(float));
+    xpu_malloc((void**)&d_gvar, F * sizeof(float));
+    float* d_bn32 = nullptr; xpu_malloc((void**)&d_bn32, out_sz * sizeof(float));
+
+    ret = xdnn::batch_norm<float>(ctx, d_conv32, d_bn32, N, F, H, W, 1e-5f, 0.9f,
+        d_scale, d_bn_bias, d_bm, d_bis, d_gmean, d_gvar, /*is_nchw=*/true);
+    printf("batch_norm ret=%d\n", ret);
+
+    float16* d_bn = nullptr; xpu_malloc((void**)&d_bn, out_sz * sizeof(float16));
+    xdnn::cast<float, float16>(ctx, d_bn32, d_bn, out_sz);
+
+    float16* d_y = nullptr; xpu_malloc((void**)&d_y, out_sz * sizeof(float16));
+    ret = xdnn::leaky_relu<float16>(ctx, d_bn, d_y, out_sz, 0.1f);
+    printf("leaky_relu ret=%d\n", ret);
+
+    xpu_wait();
+    std::vector<float16> h_y16(out_sz);
+    xpu_memcpy(h_y16.data(), d_y, out_sz * sizeof(float16), XPUMemcpyKind::XPU_DEVICE_TO_HOST);
+    for (int64_t i = 0; i < 4; i++) printf("%.5f ", (float)h_y16[i]);
+    printf("\n");
+    return ret;
+}
+```
+
+Checked against an independent CPU reference computing the same conv → per-channel batch-norm → leaky-ReLU sequence: every stage (conv output, batch-norm output, final activation) matched within FP16 rounding tolerance (max diff ≈0.0005–0.009, consistent with FP16's ~3 decimal digits of precision), including correctly-scaled negative values from the leaky-ReLU branch (e.g. device `-0.04987` vs. reference `-0.04925`). No `dmesg` warnings or hardware exceptions — unlike `grnn_cell`, this is a clean, safe, reusable pattern.
+
+**Still untested**: a full multi-layer YOLO backbone at realistic scale (this used a single conv unit, toy `8×8` spatial size) and object-detection-specific heads (anchor decoding, NMS) beyond the conv+BN+activation building block itself.

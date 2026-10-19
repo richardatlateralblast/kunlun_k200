@@ -281,6 +281,31 @@ Same dispatch-reaches-kXPU1-then-hard-assert shape, different source file/line, 
 
 **Conclusion: both `*_unit_fusion` convenience wrappers (`resnet_unit_fusion`, `yolo_unit_fusion`) are unimplemented for K100/K200 (xpu1)**, despite both having flat, non-namespaced symbols in this repo's bundled `libxpuapi.so` that this repo's own `xpu1`-candidate heuristic would otherwise read as "available." This is a concrete, hardware-confirmed instance of the caveat this repo's own methodology already states: a flat symbol existing is evidence a kernel *might* be available, not proof it dispatches correctly at runtime. **This doesn't affect anything already proven working** — the real ResNet-50/denoise cases never used these wrappers to begin with, they use plain `conv2d_fusion` (confirmed unaffected and still working throughout this testing) composed by hand with separate batchnorm/activation calls. **The actual path to YOLO-class object detection on this card, if pursued, is the same hand-composed approach `xpu_denoise` already uses** — `conv2d_fusion` + a separate `batchnorm_fwd_infer`/`_train` call per layer — not the broken `yolo_unit_fusion` shortcut. Not yet attempted: building out a real YOLO-style block this way and verifying numerically correct output (this check only confirmed the convenience wrapper is a dead end and confirmed `conv2d_fusion` dispatch/compile still works; it didn't build a full hand-composed block).
 
+## Hand-composed YOLO-style conv unit: confirmed correct on real hardware (2026-10-19)
+
+Direct follow-up to the `*_unit_fusion` finding above and the BERT/ERNIE attention result below — revisited the YOLO-class object detection question once both of those landed, since together they pointed at a concrete, well-supported next step rather than a repeat of the broken convenience wrapper. Full source: [`docs/research/20261019-xpu1-op-testing-examples.md`](docs/research/20261019-xpu1-op-testing-examples.md#6-hand-composed-yolo-style-conv-unit--working-example).
+
+**Built the hand-composed equivalent of a YOLO conv block**: `conv2d_fusion` (raw, `Activation_t::LINEAR`, no fused activation) → `baidu::xpu::api::batch_norm` (the real Context-based API, not the raw `batchnorm_fwd_infer` C function — same naming trap as `search_grnn` vs. `grnn_cell`) → `leaky_relu`. No `yolo_unit_fusion` anywhere.
+
+**First attempt, all-`float`, hit a clean `NOT_IMPLEMENT`:**
+```
+gtest_conv2d_fusion<float, float, float, float>(api::kXPU1, ...)
+[XDNN_UNIMPLEMENTED][src/wrapper/internal_conv_xpu1.cpp:624]
+conv2d_fusion ret=4
+```
+Unlike `*_unit_fusion`'s unconditional `0==1`-style assert, this is a proper, explicit `XDNN_UNIMPLEMENTED` error for this specific dtype combination on xpu1 — a real, correctly-reported capability boundary, not a broken wrapper. Switched to `conv2d_fusion<float16, float16, float16, signed char>`, matching this repo's own **proven** usage in `benchmarks/xpu_denoise.cpp` exactly (not a guess) — **this succeeded immediately** (`ret=0`).
+
+**`batch_norm<float16>` then hit the same clean `NOT_IMPLEMENT` pattern**:
+```
+gtest_batch_norm<float16>(api::kXPU1, ...)
+[XDNN_UNIMPLEMENTED][src/wrapper/nn_batch_norm.cpp:109]
+```
+Cast the FP16 conv output to FP32 (`xdnn::cast<float16,float>`), ran `batch_norm<float>` (works), cast back to FP16 (`xdnn::cast<float,float16>`) before `leaky_relu<float16>` — matching the ordinary practice of computing batch-norm statistics in FP32 even inside an otherwise-FP16 model. **This worked.**
+
+**Verified against an independent CPU reference** (not just "it returned 0" — the exact discipline the BERT/ERNIE investigation's debugging detour established as necessary): conv output, batch-norm output, and final `leaky_relu` output all matched the CPU reference within FP16 rounding tolerance (max diff ≈0.0005–0.009, consistent with FP16's ~3 decimal digits of precision) at every stage, including correctly-scaled negative values from the leaky-ReLU branch. No `dmesg` warnings or hardware exceptions.
+
+**Conclusion: YOLO-class object detection via hand-composed, unfused conv+BN+activation is confirmed working and numerically correct on K100/K200** — the second of this session's deeper workload investigations to land clean (after BERT/ERNIE attention), both following the exact pattern this repo's own methodology recommends: when a convenience wrapper is gen-gated or broken, hand-compose from the individually-proven primitives underneath it, in the dtype combination that repo's own existing benchmarks already prove works (FP16 + `signed char`/int8-accumulated TGEMM, not all-`float`), and check real numbers against a reference rather than trusting a zero return code.
+
 ## Hand-composed BERT/ERNIE-style attention: confirmed correct on real hardware (2026-10-19)
 
 Followed up on "BERT/ERNIE-era encoder inference (hand-composed, unfused attention)" with a real test — and this one is a clean positive result, unlike the `*_unit_fusion`/`grnn_cell` investigations above. Full, reusable example source: [`docs/research/20261019-xpu1-op-testing-examples.md`](docs/research/20261019-xpu1-op-testing-examples.md#1-hand-composed-berternie-style-attention--working-example).
@@ -395,7 +420,7 @@ Went past "the compiler is obtainable" to actually writing, compiling, and attem
 ## Open questions
 
 - Is the `grnn_cell` hardware exception (`sse exception`/`task fifo overflow`) a fundamental xpu1 limitation for this op, or specific to the shape/LoD/weight configuration tested? Not determined — only one configuration was tried before stopping given the severity (full reboot needed to recover). Retesting needs care: be prepared to reboot the host, and check `dmesg` immediately after each attempt rather than assuming a clean return means success.
-- Can a YOLO-class object detection block be built on K100/K200 by hand-composing `conv2d_fusion` + separate `batchnorm_fwd_infer`/`_train` calls per layer (the same pattern `xpu_denoise` already uses), now that the `yolo_unit_fusion`/`resnet_unit_fusion` convenience wrappers are confirmed not to work? Not yet attempted — see "`*_unit_fusion` convenience wrappers: confirmed broken on xpu1" above.
+- Does the hand-composed YOLO-style conv unit (`conv2d_fusion` + `batch_norm` + `leaky_relu`, confirmed correct at toy scale — see "Hand-composed YOLO-style conv unit: confirmed correct on real hardware" above) still hold up as a full multi-layer backbone at realistic scale? Not yet attempted — only a single conv unit at `8×8` spatial size has been tested.
 - Do any of this repo's other *_fusion-style convenience wrappers (beyond `resnet_unit_fusion`/`yolo_unit_fusion`) have the same "flat symbol exists, hard-asserts at runtime on xpu1" problem? Not systematically checked — these two were tested because they came up in the object-detection line of inquiry, not because of a broader sweep.
 - Why doesn't the hand-written xpu1 kernel's `xpu_wait()` complete (see "Custom xpu1 kernel proof-of-concept" above)? Leading hypothesis is missing `baidu::xpu::api::Context` initialization, untested because of the `__float128`/`<limits>` toolchain issue below. Needs either: solving that toolchain issue to test the Context hypothesis directly, or a lower-level investigation (e.g. comparing the exact ioctl sequence a working xdnn GEMM launch issues against what this proof-of-concept's raw `<<<>>>` launch issues).
 - Can XTDK 2.7.85.2 (clang 15) be made to compile code that includes the full `xdnn.h` on a very new glibc/libstdc++ (confirmed failing on Ubuntu 26.04/glibc 2.43/gcc 15)? One of two independent `__float128` incompatibilities was worked around (`bits/floatn.h`'s TC-mode typedef); the other (libstdc++ `<limits>`'s `numeric_limits<__float128>` specialization, gated on `_GLIBCXX_USE_FLOAT128`) wasn't — `-D_GLIBCXX_USE_FLOAT128=0` and `-U__SIZEOF_FLOAT128__` were both tried and didn't help. Same general class of problem as the gcc14/kernel-7.0 compatibility work already done in this repo, just not chased to a fix yet for this specific component.
