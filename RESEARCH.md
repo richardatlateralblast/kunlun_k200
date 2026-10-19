@@ -78,7 +78,31 @@ Acted on the gap above by splitting the install path in two: `scripts/install_dr
 - Pattern tests (`test_host_alloc`, `test_pageable_verify`) PASS against the DKMS-built module.
 - **Reboot survival of the DKMS-built module: confirmed.** `sudo reboot`; at `uptime 0 min`, `kunlun.ko.zst` already loaded, correct srcversion/params, `dkms status` still `installed`. Re-ran pattern tests (PASS) and the full benchmark — GEMM numbers matched the non-DKMS run within noise (FP16 large 19,284 GFLOPS @ 33.48%, FP32 large 7721 GFLOPS @ 53.62%).
 
-**Still open:** actual kernel-*upgrade* survival via `install_driver_dkms.sh` hasn't been tried (would need a real `apt` kernel bump on this host) — the autoinstall hook being present and wired is strong circumstantial evidence it'll work, but it's not the same as watching it happen.
+## DKMS kernel-upgrade survival: confirmed (2026-10-19)
+
+Closed out the last open piece of the DKMS work: does the module actually survive a kernel **upgrade** (not just a reboot), fully automatically, via the real-DKMS registration from `install_driver_dkms.sh`?
+
+**No genuinely newer kernel package was available** (this R730 host's `linux-generic` was already at the latest candidate, `7.0.0-38.38`). To still exercise the real mechanism faithfully, installed a *different*, already-available kernel version (`linux-image-7.0.0-14-generic` + matching headers) instead — DKMS's `dkms_autoinstaller` kernel-postinst hook fires on any new kernel package installation event, not on a version-number comparison, so this is the same trigger a genuine version bump would produce.
+
+**The hook fired automatically during `apt install`, no manual steps:**
+```
+Autoinstall of module kunlun-module-dkms/4.33.0 for kernel 7.0.0-14-generic (x86_64)
+Building module(s)..................... done.
+Signing module /var/lib/dkms/kunlun-module-dkms/4.33.0/build/kunlun.ko
+Installing /lib/modules/7.0.0-14-generic/updates/dkms/kunlun.ko.zst
+Running depmod... done.
+Autoinstall on 7.0.0-14-generic succeeded for module(s) kunlun-module-dkms.
+```
+`dkms status` immediately showed both kernels registered (`7.0.0-14-generic: installed` alongside the original `7.0.0-38-generic: installed`) — before any reboot.
+
+**Booted into it to confirm it's not just built but actually works.** Used `grub-reboot` for a one-time boot into `7.0.0-14-generic` (rather than changing the permanent default), rebooted:
+- `uname -r` → `7.0.0-14-generic`; `kunlun.ko.zst` already loaded with no manual `insmod`/`modprobe`, correct `vermagic`/`srcversion`, clean probe.
+- `tests/test_host_alloc`/`test_pageable_verify`: both PASS.
+- `benchmarks/xpu_perf_test 0`: GEMM FP16/FP32 numbers matched every prior run on this host within noise (FP16 large 19,156 GFLOPS @ 33.26%, FP32 large 7727 GFLOPS @ 53.66%).
+
+**Rebooted back to the default kernel (`7.0.0-38-generic`) to confirm the round trip didn't disturb anything there.** Came back clean: module auto-loaded, both kernel registrations still intact in `dkms status`, pattern tests PASS.
+
+**Conclusion: real DKMS kernel-upgrade survival is fully confirmed, not just inferred from the hook being present.** `scripts/install_driver_dkms.sh` delivers exactly what it was built for — a kernel package install alone (no reboot even required to trigger the build) results in a correctly built, signed, and installed module for the new kernel, which then loads automatically and works on first boot into it. This closes the last open question from the DKMS-split work above.
 
 ## Confirmed working: driver DMA and xdnn compute are correct (2026-10-18)
 
@@ -259,6 +283,6 @@ Checked whether Baidu's XTDK device compiler — needed to hand-write xpu1 clust
 - Is a full PaddleNLP llama2-7b run on K200 worth attempting despite the above? Given `fused_rotary_position_embedding` alone is a dead end in Paddle 2.6.1, the full tutorial wasn't downloaded/run — this is a practical judgment call based on that result, not an exhaustive test of every op the tutorial would need.
 - ~~Is Baidu's XTDK device compiler (needed to hand-write xpu1 cluster kernels) publicly obtainable at all, independent of a partner relationship?~~ **Answered 2026-10-19: yes.** See "XTDK device compiler: publicly obtainable, confirmed" below.
 - ~~Why is bandwidth roughly half the repo's originally-documented peak?~~ **Answered 2026-10-19: PCIe link negotiated to Gen3 (8GT/s), not Gen4 (16GT/s) — a hard platform limit, not a bug.** See "Bandwidth shortfall: root-caused to PCIe Gen3 link negotiation" below.
-- Does the module survive a kernel *upgrade* via the new `scripts/install_driver_dkms.sh` real-DKMS path? Not yet tried against an actual kernel bump — the `dkms_autoinstaller` kernel-postinst hook is confirmed present and wired (2026-10-19), which is strong circumstantial evidence it'll work, but it hasn't been watched happen. (The old manual `scripts/install_driver.sh` path is confirmed to need a manual rerun after a kernel upgrade — that hasn't changed, and is now the explicitly-documented tradeoff for not needing `dkms` installed at all.) Reboot survival and `rmmod`/reload are confirmed working for both scripts — see "Splitting into two install scripts" above.
+- ~~Does the module survive a kernel *upgrade* via the new `scripts/install_driver_dkms.sh` real-DKMS path?~~ **Confirmed working, 2026-10-19 — see "DKMS kernel-upgrade survival: confirmed" below.** (The old manual `scripts/install_driver.sh` path still needs a manual rerun after a kernel upgrade — that hasn't changed, and remains the explicitly-documented tradeoff for not needing `dkms` installed at all.)
 - Does this driver load and work under Secure Boot with a self-signed module? Not tried (tested host has Secure Boot off).
 - Is there a real, current driver or XRE version newer than what's in this repo, obtainable only through a direct relationship with Kunlunxin (not public downloads)? Not something answerable from outside that channel.

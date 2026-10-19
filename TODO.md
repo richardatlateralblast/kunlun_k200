@@ -5,7 +5,8 @@ Status: `[ ]` open, `[~]` in progress, `[x]` done.
 See `RESEARCH.md` for the findings behind these items (K200-on-modern-host work) and its "Open questions" section for the todo list this mirrors.
 
 ## Open
-- [ ] Test `scripts/install_driver_dkms.sh` survival across an actual kernel package upgrade (not just a reboot) on the R730 host — the `dkms_autoinstaller` kernel-postinst hook is confirmed present and wired, but hasn't been watched fire on a real kernel bump.
+
+Nothing currently — see "Later (non-essential)" below for deprioritized items.
 
 ## Later (non-essential)
 
@@ -14,6 +15,7 @@ See `RESEARCH.md` for the findings behind these items (K200-on-modern-host work)
 
 ## Done
 
+- [x] Test `scripts/install_driver_dkms.sh` survival across an actual kernel package upgrade (2026-10-19, R730 host): **confirmed working, not just inferred.** No genuinely newer kernel was available, so installed a different already-available version (`7.0.0-14-generic`) instead — DKMS's `dkms_autoinstaller` hook fires on any new kernel install, not a version comparison, so this exercises the identical mechanism. The hook fired automatically during `apt install` with zero manual steps (`Autoinstall ... succeeded for module(s) kunlun-module-dkms`), `dkms status` showed both kernels registered before any reboot. Booted into the new kernel via a one-time `grub-reboot` (not changing the permanent default): module auto-loaded with correct vermagic, clean probe, pattern tests + full GEMM benchmark all pass. Rebooted back to the default kernel (`7.0.0-38-generic`) and confirmed it's unaffected — still works cleanly, both kernel registrations intact. This was the last open item on this list. See `RESEARCH.md` "DKMS kernel-upgrade survival: confirmed".
 - [x] Investigate the ~2x bandwidth shortfall vs the repo's documented peak (2026-10-19, R730 host): **root-caused — PCIe link negotiated to Gen3 (8GT/s), not the card's rated Gen4 (16GT/s)**, confirmed via `lspci -vvv` (`LnkCap: 16GT/s` vs `LnkSta: 8GT/s (downgraded)`). Cause: the host CPU (Xeon E5-2682 v4, Broadwell-EP) has no Gen4 PCIe root complex at all — a hard silicon limit, not a BIOS setting or driver bug. Topology confirmed clean (card directly under the CPU's own root port, no intervening switch). The ~2x ratio and both bandwidth numbers' efficiency bands match the Gen3-vs-Gen4 theoretical rates almost exactly. Confirms the "different hardware" hypothesis for the original S4–S9 numbers. Not fixable without different (Gen4-capable) host hardware. See `RESEARCH.md` "Bandwidth shortfall: root-caused to PCIe Gen3 link negotiation".
 
 - [x] Check whether Baidu's XTDK device compiler is publicly obtainable at all (2026-10-19): **yes, confirmed.** This repo's own bundled `xdnn-ubuntu_x86_64/plugin/script/{dependency,get_platformInfo,cmake_build}.sh` already pin the exact version (2.7.85.2, LLVM 15-based `clang++`) and an unauthenticated public download URL (`klx-sdk-release-public.su.bcebos.com`); verified live with `curl -I` (three OS variants all return `HTTP 200` with real content-lengths) and a partial download (genuine gzip tar, ~3.7GB uncompressed). Clears the compiler-availability blocker for both the custom llama.cpp/ggml-backend idea and the GNN scatter-add-kernel idea — the much bigger remaining blocker (hand-writing and verifying the actual cluster kernels) is untouched. See `RESEARCH.md` "XTDK device compiler: publicly obtainable, confirmed".

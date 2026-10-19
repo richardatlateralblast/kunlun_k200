@@ -100,7 +100,7 @@ Legend: ✅ confirmed working · ❌ confirmed broken · 🚫 confirmed unsuppor
 | GEMM compute, INT8 | 🚫 | Correctly reports unsupported — KL1 firmware limitation, not a driver bug |
 | PCIe bandwidth at documented peak | 🚫 | **Root-caused**: this test host's CPU (Broadwell-EP) has no PCIe Gen4 controller — link negotiates to Gen3 (8GT/s) vs the card's rated 16GT/s, confirmed via `lspci` (`LnkSta: 8GT/s (downgraded)`). A hard platform limit, not a driver/software issue — would need different (Gen4-capable) host hardware. See `RESEARCH.md` |
 | Reboot persistence (either install script) | ✅ | Confirmed via a real reboot on the R730 host, both the manual and real-DKMS scripts |
-| Kernel-*upgrade* persistence (`install_driver_dkms.sh`) | ❓ | Real-DKMS registration + `dkms_autoinstaller` hook confirmed present and wired; not watched fire on an actual kernel bump yet |
+| Kernel-*upgrade* persistence (`install_driver_dkms.sh`) | ✅ | Confirmed end to end: installing a new kernel package auto-triggers `dkms_autoinstaller`, which builds/signs/installs the module with no manual steps; the new kernel then boots with it already loaded, passing pattern tests and the full benchmark — see `RESEARCH.md` |
 | Secure Boot with a self-signed module | ❓ | Test host currently has Secure Boot off |
 | `kunlun_peermem.ko` (Mellanox GPUDirect RDMA) | 🚫 | Needs MLNX_OFED's IB peer-memory symbols, not present on the test host — correctly inert, not a bug |
 
@@ -266,7 +266,6 @@ The S0–S9 work above targeted kernel 6.8. This section covers building and run
 
 ### Untested
 
-- Surviving a kernel **upgrade** via `scripts/install_driver_dkms.sh`'s real-DKMS registration (reboot survival for both install scripts is confirmed — see the table in "Install" above; an actual kernel-version bump hasn't been tried).
 - Loading under Secure Boot with a self-signed module (test host has Secure Boot off; the module is unsigned and taints the kernel on load).
 - gcc 14 specifically (built and verified with gcc 15.2 plus the wrapper below). gcc 13 fails outright on a 7.0 kernel build (`-fmin-function-alignment` is rejected).
 
