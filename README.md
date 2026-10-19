@@ -83,6 +83,59 @@ Large vendor trees under `third_party/` are **gitignored**.
 
 ---
 
+## Capabilities (K200 / KL1)
+
+Single at-a-glance index of what's actually confirmed on this card, kept up to date as findings land (see maintenance note below). Detail and evidence for every row live in [`RESEARCH.md`](RESEARCH.md) and the sections linked inline; this table is the summary, not the write-up.
+
+Legend: ✅ confirmed working · ❌ confirmed broken · 🚫 confirmed unsupported (hardware/software gap, not fixable by config) · ⚠️ plausible, not yet tested end-to-end · ❓ untested, no evidence either way
+
+### Driver & platform
+
+| Capability | Status | Notes |
+|---|:---:|---|
+| Build for kernel 6.15+/7.0 (gcc 14+) | ✅ | `kunlun.ko`/`kunlun_peermem.ko` build clean — [Kernel 7.0 / modern host support](#kernel-70--modern-host-support) |
+| Driver load / probe | ✅ | Clean probe, `/dev/xpu0`/`xpu1`/`xpuctrl`, no warnings/oopses |
+| DMA correctness (`xpu_host_alloc`, pageable) | ✅ | `tests/test_host_alloc`/`test_pageable_verify` pattern checks pass |
+| GEMM compute, FP16/FP32 | ✅ | Matches this repo's own documented baselines — [Key benchmarks](#key-benchmarks-k200-post-s9--cases) |
+| GEMM compute, INT8 | 🚫 | Correctly reports unsupported — KL1 firmware limitation, not a driver bug |
+| PCIe bandwidth at documented peak | ❌ | Reproducibly ~half the documented peak (pageable H2D ~5.3 vs ~10.1 GB/s); compute unaffected. Cause still open — see `RESEARCH.md` |
+| Reboot persistence (either install script) | ✅ | Confirmed via a real reboot on the R730 host, both the manual and real-DKMS scripts |
+| Kernel-*upgrade* persistence (`install_driver_dkms.sh`) | ❓ | Real-DKMS registration + `dkms_autoinstaller` hook confirmed present and wired; not watched fire on an actual kernel bump yet |
+| Secure Boot with a self-signed module | ❓ | Test host currently has Secure Boot off |
+| `kunlun_peermem.ko` (Mellanox GPUDirect RDMA) | 🚫 | Needs MLNX_OFED's IB peer-memory symbols, not present on the test host — correctly inert, not a bug |
+
+### ML frameworks / serving stacks
+
+| Capability | Status | Notes |
+|---|:---:|---|
+| Official `paddlepaddle-xpu` wheel — on-device compute (add/matmul/RNG) | ✅ | Numerically correct against real random data |
+| Official `paddlepaddle-xpu` wheel — `paddle.to_tensor(host_array)` | ❌ | Silent no-op: reads return stale content from a previous device allocation, not the host data. Root cause unisolated — see `RESEARCH.md` |
+| Fixing the wheel by pointing it at this repo's own `libxpuapi.so` | ❌ | Confirmed ABI-incompatible — fails at import (`undefined symbol`), both via `LD_LIBRARY_PATH` and file replacement |
+| `vllm-kunlun` (Baidu's official vLLM plugin) | 🚫 | Kunlun3 (P800) only; K100/K200 unsupported, open feature request with no maintainer response |
+| FastDeploy | 🚫 | Needs driver ≥5.0.21.26 on P800; this card's driver line (4.33.0) is unrelated and far older |
+| PaddleOCR / PaddleOCR-VL / PaddleX | 🚫 | Target R200/R300/P800 only |
+| Ollama / llama.cpp (`ggml`) | 🚫 | No Kunlun backend of any kind exists upstream or third-party |
+| PaddleNLP llama2-7b tutorial, on the official wheel | ❌ | Dead end confirmed directly: wheel's `libxpuapi.so` does have `xpu1`-candidate RoPE/SwiGLU/RMSNorm/paged-attention symbols, but Paddle 2.6.1 has no XPU kernel registered for `fused_rotary_position_embedding` at all |
+
+### Workload feasibility beyond LLM serving (static analysis of `libxpuapi.so`'s own symbol table, see `RESEARCH.md` "Other workloads")
+
+| Capability | Status | Notes |
+|---|:---:|---|
+| CNN vision inference (ResNet-50-class, fixed-size attention) | ✅ | Already proven by this repo's own cases — [Key benchmarks](#key-benchmarks-k200-post-s9--cases) |
+| Bare compute/RNG coprocessor (direct xdnn/XPURT calls, no framework) | ✅ | What this repo's own benchmarks/tests already do — lowest-risk path for anything new |
+| K-means clustering | ⚠️ | Every needed primitive present and ungated (GEMM, `argmin`, one-hot trick for centroid update); untested end-to-end |
+| CTR / ranking / recommendation (GRNN/DSSM/Wide&Deep-style) | ⚠️ | Looks like this card's original intended workload; untested on real weights |
+| Classic object detection (YOLO-class via `yolo_unit_fusion`) | ⚠️ | Same envelope as proven CNN cases; untested |
+| Classic (non-VL) OCR inference, pretrained (CRNN: conv+RNN+softmax) | ⚠️ | Inference looks feasible; **training** blocked (`ctc_loss_bwd` is gen-gated) |
+| BERT/ERNIE-era encoder inference (hand-composed, unfused attention) | ⚠️ | GEMM+softmax+layer_norm all present; not confirmed end to end |
+| Graph neural networks (message passing) | 🚫 | `index_add`/scatter-add is gen-gated (`xpu2::`/`xpu3::` only); no SpMM anywhere in this SDK regardless of generation |
+| LLM transformer serving (RoPE/SwiGLU/RMSNorm/paged-attention) | 🚫 | Not implemented for xpu1 in this repo's `libxpuapi.so` at all (gen-gated to `xpu2::`/`xpu3::`); present-but-undispatched in the Paddle wheel's own build (see above) |
+| Custom `ggml`/llama.cpp backend via hand-written cluster kernels | ❓ | Blocked pending whether Baidu's XTDK device compiler is obtainable at all — unanswered |
+
+**Maintenance:** this table should be updated in the same change as any work that confirms, breaks, or newly tests one of these capabilities — see `CLAUDE.md`'s per-change checklist.
+
+---
+
 ## Key benchmarks (K200, post S9 + cases)
 
 Measured on production knobs after S4–S9. Full write-ups under `docs/impl/` and `results/cases/`.
@@ -208,7 +261,7 @@ The S0–S9 work above targeted kernel 6.8. This section covers building and run
 | Layer | Result |
 |-------|--------|
 | PCIe bandwidth | Real, non-zero, but **roughly half** the documented peak (pageable H2D up to 5.35 vs. ~10.1 GB/s; `xpu_host_alloc` H2D up to 6.29 vs. ~12.5 GB/s). Compute is unaffected — see `RESEARCH.md` open questions. |
-| Official `paddlepaddle-xpu` 2.6.1 wheel | Detects the card (`device_count()` → 2) but gives **silently wrong results**: a plain `paddle.to_tensor(host_array).numpy()` round-trip, elementwise add, and matmul all come back all-zero with no error; `paddle.randn(...)` raises `XDNN_INVALID_PARAM`. Root cause: the wheel bundles its own, different-build `libxpuapi.so`, not this repo's driver or XPURT layer (both proven correct above). Not yet tried: forcing the wheel to load this repo's own `libxpuapi.so` instead. |
+| Official `paddlepaddle-xpu` 2.6.1 wheel | Detects the card (`device_count()` → 2). **On-device compute (add, matmul, random generation) is actually correct.** The bug is narrower: `paddle.to_tensor(host_array)` — staging a numpy array onto the XPU — is a **silent no-op**; reads return stale content from a previous, unrelated device allocation, not zeros or corrupted data (confirmed by freeing a known-value tensor and immediately reading its memory back through an unrelated `to_tensor()` call). Not fixable by pointing the wheel at this repo's own `libxpuapi.so`: confirmed **ABI-incompatible** (fails at import, `undefined symbol` on a `layer_norm_grad` overload with a different signature between the two builds). The wheel's bundled library does have `xpu1`-candidate RoPE/SwiGLU/RMSNorm/paged-attention symbols this repo's copy lacks, but it's moot — Paddle 2.6.1 has no XPU kernel registered for `fused_rotary_position_embedding` at all (confirmed via a direct runtime call), so PaddleNLP's llama2-7b tutorial is a dead end on this wheel regardless. See `RESEARCH.md` for the full isolation. |
 | vLLM / FastDeploy / current PaddleOCR-XPU | **Not an option on this card at all**, independent of driver state: these all target Kunlun2 (R200/R300) or Kunlun3 (P800), a different runtime stack (`xpytorch`) with no KL1 equivalent. |
 
 ### Untested
