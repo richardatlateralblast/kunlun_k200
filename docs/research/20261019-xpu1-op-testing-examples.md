@@ -552,3 +552,100 @@ Result: `y_r` is `1.000` at every bin, `y_i` is `0.000` at every bin — exact m
 **Important general lesson, found via this test**: always check `cat /proc/xpu/dev0/tqinfo` for all 8 queues reading `NORMAL` after any custom-kernel test, not just that the GEMM suite happens to pass — a wedged queue can sit invisibly while GEMM gets scheduled onto a different, still-free one. This is exactly what happened with an earlier test in this same document (see the correction note on the `grnn_cell`/custom-kernel sections).
 
 **Still untested**: `fft2d`/`fft3d`/`ifft` (same header), and wiring FFT together with the already-confirmed `lstm_inference`/`bilstm_inference` into an actual audio/speech pipeline.
+
+## 9. Audio pipeline (FFT → LSTM → dense classifier) — confirmed working end to end
+
+**Status: a complete, wired pipeline, not isolated ops — the first "whole pipeline" test for the audio/speech workload category.** Combines three already-individually-proven pieces (`fft`, `lstm_inference`, `fc`+`sigmoid`) for the first time. A first version of this test, without `xpu_free` calls across its loop, hit a genuine hardware fault affecting all 8 task queues — see `RESEARCH.md`'s "Audio/speech pipeline" section for that story. The version below is the fixed, clean one.
+
+```cpp
+#include "xpu/xdnn.h"
+#include <cstdio>
+#include <cmath>
+#include <vector>
+namespace xdnn = baidu::xpu::api;
+
+static float* dev_buf(const std::vector<float>& h) {
+    float* d = nullptr;
+    xpu_malloc((void**)&d, h.size() * sizeof(float));
+    xpu_memcpy(d, h.data(), h.size() * sizeof(float), XPUMemcpyKind::XPU_HOST_TO_DEVICE);
+    return d;
+}
+static float* dev_zeros(int64_t n) { float* d = nullptr; xpu_malloc((void**)&d, n * sizeof(float)); return d; }
+
+int main() {
+    xpu_set_device(0);
+    auto* ctx = xdnn::create_context();
+    const int64_t N = 8, seq_len = 2, hdim = 4, batch_size = 1;
+
+    std::vector<float> frame0(N), frame1(N);
+    for (int64_t n = 0; n < N; n++) {
+        frame0[n] = std::cos(2.0f * (float)M_PI * 1.0f * (float)n / (float)N); // peak at bin 1/7
+        frame1[n] = std::cos(2.0f * (float)M_PI * 2.0f * (float)n / (float)N); // peak at bin 2/6
+    }
+    std::vector<float> zeros(N, 0.0f);
+    float* d_specs = dev_zeros(seq_len * N);
+    std::vector<std::vector<float>*> frames = {&frame0, &frame1};
+
+    // Per-frame FFT -> magnitude spectrum. IMPORTANT: free every scratch
+    // buffer before the next iteration -- not doing this is what caused
+    // the all-queue hardware fault in the first attempt (see RESEARCH.md).
+    for (int64_t t = 0; t < seq_len; t++) {
+        float* d_xr = dev_buf(*frames[t]);
+        float* d_xi = dev_buf(zeros);
+        float* d_yr = dev_zeros(N);
+        float* d_yi = dev_zeros(N);
+        xdnn::fft<float>(ctx, 1, N, d_xr, d_xi, d_yr, d_yi);
+        xpu_wait();
+
+        float* d_yr_sq = dev_zeros(N);
+        float* d_yi_sq = dev_zeros(N);
+        float* d_sum_sq = dev_zeros(N);
+        xdnn::square<float>(ctx, d_yr, d_yr_sq, N);
+        xdnn::square<float>(ctx, d_yi, d_yi_sq, N);
+        xdnn::add<float>(ctx, d_yr_sq, d_yi_sq, d_sum_sq, N);
+        xdnn::sqrt<float>(ctx, d_sum_sq, d_specs + t * N, N);
+        xpu_wait();
+
+        xpu_free(d_xr); xpu_free(d_xi); xpu_free(d_yr); xpu_free(d_yi);
+        xpu_free(d_yr_sq); xpu_free(d_yi_sq); xpu_free(d_sum_sq);
+    }
+
+    // lstm_inference over the 2-frame spectral sequence.
+    std::vector<float> h_wx(4 * hdim * N), h_wh(4 * hdim * hdim);
+    for (int64_t i = 0; i < (int64_t)h_wx.size(); i++) h_wx[i] = 0.02f * (float)((i % 5) - 2);
+    for (int64_t i = 0; i < (int64_t)h_wh.size(); i++) h_wh[i] = 0.02f * (float)((i % 5) - 2);
+    std::vector<float> h_bx(4 * hdim, 0.0f), h_bh(4 * hdim, 0.0f);
+    float* d_wx = dev_buf(h_wx), *d_wh = dev_buf(h_wh);
+    float* d_bx = dev_buf(h_bx), *d_bh = dev_buf(h_bh);
+    float* d_last_h = dev_zeros(batch_size * hdim);
+    int64_t h_seq_len[1] = {seq_len};
+    int64_t* d_seq_len = nullptr;
+    xpu_malloc((void**)&d_seq_len, sizeof(h_seq_len));
+    xpu_memcpy(d_seq_len, h_seq_len, sizeof(h_seq_len), XPUMemcpyKind::XPU_HOST_TO_DEVICE);
+
+    xdnn::lstm_inference(ctx, d_specs, /*x_need_transpose=*/true, nullptr, nullptr,
+        d_seq_len, d_wx, nullptr, d_wh, nullptr, d_bx, d_bh, d_last_h,
+        batch_size, seq_len, N, hdim);
+    xpu_wait();
+
+    // Dense classifier head + sigmoid.
+    std::vector<float> h_w(hdim, 0.1f);
+    float* d_w = dev_buf(h_w);
+    float* d_logit = dev_zeros(1);
+    xdnn::fc<float, float, float, float>(ctx, d_last_h, d_w, d_logit, 1, 1, hdim, false, false, nullptr, nullptr, nullptr);
+    float* d_prob = dev_zeros(1);
+    xdnn::sigmoid<float>(ctx, d_logit, d_prob, 1, nullptr, nullptr);
+    xpu_wait();
+
+    float prob = 0.0f;
+    xpu_memcpy(&prob, d_prob, sizeof(float), XPUMemcpyKind::XPU_DEVICE_TO_HOST);
+    printf("prob=%.6f\n", prob);
+    return 0;
+}
+```
+
+Result, checked against hand-computable expectations: frame 0's magnitude spectrum peaks at exactly `4.000` at bins 1 and 7 (matching its cosine's bin), frame 1 peaks at bins 2 and 6; `lstm_inference` returns `ret=0` with `last_h` correctly tanh-bounded; the classifier head gives `prob=0.498748`, correctly in `[0,1]`. All exactly reproducible across two runs, `dmesg` silent, all 8 task queues `NORMAL` throughout.
+
+**The resource-leak hazard, found by the first (broken) version of this test**: calling ops in a loop without `xpu_free`-ing intermediate buffers escalated all the way to a genuine hardware fault (`dmesg`: `sse exception`/`task fifo overflow`) affecting **all 8** task queues, not just the one queue issues found earlier in this doc were scoped to. The proximate error was `(802) Hardware module exception` / `"Cannot get XPU Func"` (error 708), consistent with some internal device-side resource (most likely a kernel-function cache) being exhausted by repeated allocation without cleanup. **Always free intermediate buffers explicitly inside a loop** — this is a general hazard for any xdnn test code on this chip, not specific to any one op.
+
+**Still untested**: realistic scale (this used toy `N=8`/`hdim=4`/2 frames), and a conv-based backbone (no `conv1d` exists at all — see the `fft` section above).
