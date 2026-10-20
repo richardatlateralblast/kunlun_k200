@@ -505,3 +505,50 @@ int main() {
 Result: `assign = [0, 0, 1, 1]`, `centroid_sum = [0, 1, 10, 11]`, `counts = [2, 2]` — exact bit-match to the hand-computed expectation. With `XPUAPI_DEBUG=1`, nine distinct real `gtest_*<...>(api::kXPU1, ...)` dispatch traces appear (`square` ×2, `reduce_sum` ×2, `fc_fusion` ×2, `scale`, `broadcast_add` ×2, `argmin`, `one_hot`), confirming every stage genuinely computes on the chip. `xpu_wait()` returned `0`, `dmesg` logged nothing at all, and the result is exactly reproducible across two runs. Post-test device health reconfirmed with the full GEMM suite — no degradation.
 
 **Nothing left untested for the algorithm itself** — this is a complete iteration, not a building block. The only open item is the one already noted at the static-analysis stage: iteration cost (several kernel launches per pass), unaffected by this result.
+
+## 8. `fft` — confirmed working
+
+**Status: dispatches, computes correctly, leaves the device healthy.** `baidu::xpu::api::fft<float>` from `xpu/refactor/math.h` — a complex-to-complex FFT, flat and non-namespaced. Uses two hand-verifiable cases (a unit impulse and a pure cosine) rather than just checking it runs.
+
+```cpp
+#include "xpu/xdnn.h"
+#include <cstdio>
+#include <cmath>
+#include <vector>
+namespace xdnn = baidu::xpu::api;
+
+static float* dev_buf(const std::vector<float>& h) {
+    float* d = nullptr;
+    xpu_malloc((void**)&d, h.size() * sizeof(float));
+    xpu_memcpy(d, h.data(), h.size() * sizeof(float), XPUMemcpyKind::XPU_HOST_TO_DEVICE);
+    return d;
+}
+static float* dev_zeros(int64_t n) { float* d = nullptr; xpu_malloc((void**)&d, n * sizeof(float)); return d; }
+
+int main() {
+    xpu_set_device(0);
+    auto* ctx = xdnn::create_context();
+    const int64_t N = 8;
+
+    // Unit impulse: x[0]=1, rest 0 -> DFT is a constant 1 (real), 0 (imag) at every bin.
+    std::vector<float> xr(N, 0.0f); xr[0] = 1.0f;
+    std::vector<float> xi(N, 0.0f);
+    float* d_xr = dev_buf(xr), *d_xi = dev_buf(xi);
+    float* d_yr = dev_zeros(N), *d_yi = dev_zeros(N);
+
+    int ret = xdnn::fft<float>(ctx, /*batch_size=*/1, N, d_xr, d_xi, d_yr, d_yi);
+    printf("fft ret=%d xpu_wait=%d\n", ret, xpu_wait());
+
+    std::vector<float> yr(N), yi(N);
+    xpu_memcpy(yr.data(), d_yr, N * sizeof(float), XPUMemcpyKind::XPU_DEVICE_TO_HOST);
+    xpu_memcpy(yi.data(), d_yi, N * sizeof(float), XPUMemcpyKind::XPU_DEVICE_TO_HOST);
+    printf("y_r[0]=%.3f y_i[0]=%.3f (expect 1.000, 0.000, same at every bin)\n", yr[0], yi[0]);
+    return 0;
+}
+```
+
+Result: `y_r` is `1.000` at every bin, `y_i` is `0.000` at every bin — exact match to the impulse's known DFT. A second case (a pure cosine at bin `k0=1`, N=8) gave `y_r = [0,4,0,0,0,0,0,4]` (the two expected spikes of `N/2=4` at bins 1 and `N-1=7`), `y_i` all ~0 — also exact, and confirms this is a genuine FFT rather than a pass-through. `XPUAPI_DEBUG=1` shows `gtest_fft<float>(api::kXPU1, 1, 8, ...)` — genuine dispatch, not a stub. `ret=0`, `xpu_wait()=0`, reproducible across two runs, `dmesg` silent, and — checked properly this time (see the methodological correction in `RESEARCH.md`'s "`fft<float>`" section) — **all 8 hardware task queues (`/proc/xpu/dev0/tqinfo`) confirmed `NORMAL`** both before and after, not just a GEMM pass.
+
+**Important general lesson, found via this test**: always check `cat /proc/xpu/dev0/tqinfo` for all 8 queues reading `NORMAL` after any custom-kernel test, not just that the GEMM suite happens to pass — a wedged queue can sit invisibly while GEMM gets scheduled onto a different, still-free one. This is exactly what happened with an earlier test in this same document (see the correction note on the `grnn_cell`/custom-kernel sections).
+
+**Still untested**: `fft2d`/`fft3d`/`ifft` (same header), and wiring FFT together with the already-confirmed `lstm_inference`/`bilstm_inference` into an actual audio/speech pipeline.
