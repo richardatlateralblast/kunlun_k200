@@ -755,3 +755,70 @@ int main() {
 ```
 
 **Still untested**: `interpolate1d` (same op family, not retested given `interpolate2d`'s clean pass), `interpolate2d`'s bilinear (`is_nearest=false`) mode and `trans_mode` variants, `roi_align`'s FP16 instantiation, multi-ROI/multi-image-batch `lod` handling, and `ps_roi_align`/`ps_roi_pool` (position-sensitive variants, not checked at all). A model's decoder path built from `interpolate2d`+`roi_align` alone (skipping `conv2d_transpose`/`roi_pool`) is the realistic feasible path on this card.
+
+## 11. NCF-style recommendation (`gather` + `fc` + sigmoid) — confirmed working
+
+**Status: confirmed correct and reproducible.** Closes the "NCF-style recommendation" item flagged 2026-10-20 — a credible alternative to the CTR/ranking row's `grnn_cell` hardware exception, since Neural Collaborative Filtering needs no recurrent cell at all. `gather<float,int>`, `fc<float,float,float,float>`, and `sigmoid<float>` were each confirmed as concrete xpu1 instantiations in `libxpuapi.so` first.
+
+```cpp
+#include "xpu/xdnn.h"
+#include <cstdio>
+#include <cmath>
+namespace api = baidu::xpu::api;
+
+int main() {
+    api::Context* ctx = api::create_context();
+
+    // User embedding table: 2 users x 2-dim: [[1,2],[3,4]]
+    float h_user_emb[4] = {1, 2, 3, 4};
+    // Item embedding table: 2 items x 2-dim: [[5,6],[7,8]]
+    float h_item_emb[4] = {5, 6, 7, 8};
+    int h_user_idx[1] = {1};  // user_id=1 -> [3,4]
+    int h_item_idx[1] = {0};  // item_id=0 -> [5,6]
+
+    float *d_user_emb, *d_item_emb, *d_concat;
+    int *d_user_idx, *d_item_idx;
+    xpu_malloc((void**)&d_user_emb, 4 * sizeof(float));
+    xpu_malloc((void**)&d_item_emb, 4 * sizeof(float));
+    xpu_malloc((void**)&d_concat, 4 * sizeof(float));  // [user_vec(2), item_vec(2)]
+    xpu_malloc((void**)&d_user_idx, sizeof(int));
+    xpu_malloc((void**)&d_item_idx, sizeof(int));
+    xpu_memcpy(d_user_emb, h_user_emb, 4 * sizeof(float), XPU_HOST_TO_DEVICE);
+    xpu_memcpy(d_item_emb, h_item_emb, 4 * sizeof(float), XPU_HOST_TO_DEVICE);
+    xpu_memcpy(d_user_idx, h_user_idx, sizeof(int), XPU_HOST_TO_DEVICE);
+    xpu_memcpy(d_item_idx, h_item_idx, sizeof(int), XPU_HOST_TO_DEVICE);
+
+    // Embedding lookups (axis=0 row gather), writing directly into the two
+    // halves of the concatenation buffer -- no separate concat kernel needed.
+    api::gather<float, int>(ctx, d_user_emb, d_user_idx, d_concat, {2, 2}, 1, 0);
+    api::gather<float, int>(ctx, d_item_emb, d_item_idx, d_concat + 2, {2, 2}, 1, 0);
+    xpu_wait();
+
+    // Dense MLP head: single fc layer, weight = 0.1 for every input, no bias.
+    float h_w[4] = {0.1f, 0.1f, 0.1f, 0.1f};
+    float* d_w;
+    xpu_malloc((void**)&d_w, 4 * sizeof(float));
+    xpu_memcpy(d_w, h_w, 4 * sizeof(float), XPU_HOST_TO_DEVICE);
+
+    float *d_logit, *d_prob;
+    xpu_malloc((void**)&d_logit, sizeof(float));
+    xpu_malloc((void**)&d_prob, sizeof(float));
+    api::fc<float, float, float, float>(ctx, d_concat, d_w, d_logit, 1, 1, 4, false, false, nullptr, nullptr, nullptr);
+    api::sigmoid<float>(ctx, d_logit, d_prob, 1, nullptr, nullptr);
+    xpu_wait();
+
+    float prob = 0.0f;
+    xpu_memcpy(&prob, d_prob, sizeof(float), XPU_DEVICE_TO_HOST);
+    printf("prob=%.6f\n", prob);  // expect sigmoid(0.1*(3+4+5+6)) = sigmoid(1.8) = 0.858149
+
+    xpu_free(d_user_emb); xpu_free(d_item_emb); xpu_free(d_concat);
+    xpu_free(d_user_idx); xpu_free(d_item_idx); xpu_free(d_w);
+    xpu_free(d_logit); xpu_free(d_prob);
+    api::destroy_context(ctx);
+    return 0;
+}
+```
+
+Result: both `gather` calls `ret=0`, concatenated vector read back exactly as `[3,4,5,6]`, `fc` `ret=0`, `sigmoid` `ret=0`, `prob=0.858139` against the hand-computed `0.858149` — the ~1e-5 gap is the device's `fast_sigmoid` approximation (visible in the `XPUAPI_DEBUG=1` trace), well inside tolerance. Reproducible across two runs, `dmesg` silent, all 8 task queues `NORMAL` both times.
+
+**Still untested**: realistic embedding-table and batch sizes (only 2×2 toy tables and a single lookup were used), and a multi-layer MLP tower (only one `fc` layer was tested; real NCF models stack several with ReLU between them).
