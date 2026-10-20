@@ -506,9 +506,9 @@ Result: `assign = [0, 0, 1, 1]`, `centroid_sum = [0, 1, 10, 11]`, `counts = [2, 
 
 **Nothing left untested for the algorithm itself** — this is a complete iteration, not a building block. The only open item is the one already noted at the static-analysis stage: iteration cost (several kernel launches per pass), unaffected by this result.
 
-## 8. `fft` — confirmed working
+## 8. `fft` — correct when it runs, reliability now in question
 
-**Status: dispatches, computes correctly, leaves the device healthy.** `baidu::xpu::api::fft<float>` from `xpu/refactor/math.h` — a complex-to-complex FFT, flat and non-namespaced. Uses two hand-verifiable cases (a unit impulse and a pure cosine) rather than just checking it runs.
+**Status: dispatches and computes correctly — but see the correction in example 9 below before treating this as reliably safe to call repeatedly.** `baidu::xpu::api::fft<float>` from `xpu/refactor/math.h` — a complex-to-complex FFT, flat and non-namespaced. Uses two hand-verifiable cases (a unit impulse and a pure cosine) rather than just checking it runs. An `fft`+chained-ops pattern was later found to fault intermittently (~50% in a small sample) regardless of code changes — see example 9.
 
 ```cpp
 #include "xpu/xdnn.h"
@@ -553,9 +553,9 @@ Result: `y_r` is `1.000` at every bin, `y_i` is `0.000` at every bin — exact m
 
 **Still untested**: `fft2d`/`fft3d`/`ifft` (same header), and wiring FFT together with the already-confirmed `lstm_inference`/`bilstm_inference` into an actual audio/speech pipeline.
 
-## 9. Audio pipeline (FFT → LSTM → dense classifier) — confirmed working end to end
+## 9. Audio pipeline (FFT → LSTM → dense classifier) — correct logic, intermittent fault (~50% in a small sample)
 
-**Status: a complete, wired pipeline, not isolated ops — the first "whole pipeline" test for the audio/speech workload category.** Combines three already-individually-proven pieces (`fft`, `lstm_inference`, `fc`+`sigmoid`) for the first time. A first version of this test, without `xpu_free` calls across its loop, hit a genuine hardware fault affecting all 8 task queues — see `RESEARCH.md`'s "Audio/speech pipeline" section for that story. The version below is the fixed, clean one.
+**Status: the pipeline's logic and math are confirmed correct when it completes; it fails intermittently for reasons not yet understood, roughly half the time in a four-run sample — do not treat this as a reliably-safe-to-rerun test.** Combines three already-individually-proven pieces (`fft`, `lstm_inference`, `fc`+`sigmoid`) for the first time. A first version hit a genuine hardware fault (all 8 task queues); adding `xpu_free` calls made the next run pass, and this doc originally (wrongly) concluded that fixed it. It didn't: isolating the change and rerunning the identical code four times from a verified-clean state each time gave FAIL, PASS, PASS, FAIL. It later escalated to faulting the standard GEMM benchmark itself, which needed a full reboot to clear. See `RESEARCH.md`'s "Audio/speech pipeline" section for the full, corrected account before relying on this example.
 
 ```cpp
 #include "xpu/xdnn.h"
@@ -646,6 +646,6 @@ int main() {
 
 Result, checked against hand-computable expectations: frame 0's magnitude spectrum peaks at exactly `4.000` at bins 1 and 7 (matching its cosine's bin), frame 1 peaks at bins 2 and 6; `lstm_inference` returns `ret=0` with `last_h` correctly tanh-bounded; the classifier head gives `prob=0.498748`, correctly in `[0,1]`. All exactly reproducible across two runs, `dmesg` silent, all 8 task queues `NORMAL` throughout.
 
-**The resource-leak hazard, found by the first (broken) version of this test**: calling ops in a loop without `xpu_free`-ing intermediate buffers escalated all the way to a genuine hardware fault (`dmesg`: `sse exception`/`task fifo overflow`) affecting **all 8** task queues, not just the one queue issues found earlier in this doc were scoped to. The proximate error was `(802) Hardware module exception` / `"Cannot get XPU Func"` (error 708), consistent with some internal device-side resource (most likely a kernel-function cache) being exhausted by repeated allocation without cleanup. **Always free intermediate buffers explicitly inside a loop** — this is a general hazard for any xdnn test code on this chip, not specific to any one op.
+**Correction, found the same day: this is not a reliable fix, and not confirmed to be the real cause.** The first (broken) version of this test, which never called `xpu_free`, hit `(802) Hardware module exception` / `"Cannot get XPU Func"` and escalated to `sse exception`/`task fifo overflow` affecting all 8 task queues. Adding `xpu_free` calls (alongside per-iteration `xpu_wait()` calls that were *also* added at the same time) made it pass cleanly, and this doc originally concluded the leak was the cause. **That conclusion didn't hold up**: isolating the change (keeping the `xpu_wait()` calls, removing only `xpu_free`, freeing everything safely at the end instead) and running the identical binary four times from a freshly-verified-clean state each time gave **FAIL, PASS, PASS, FAIL** — the same code, the same starting state, different outcomes. This is a roughly 50% intermittent fault, not something `xpu_free` reliably prevents. It later escalated further: the standard `xpu_perf_test` GEMM suite, run cleanly dozens of times elsewhere in this investigation, hit the identical fault signature and needed a full host reboot (not just a driver reload) to clear. See `RESEARCH.md`'s "Audio/speech pipeline" section for the full account. **Still good practice regardless**: free every intermediate buffer explicitly inside a loop. **Not good practice to assume**: that doing so reliably prevents this fault, or that a single clean run of this or any other test here means it will reliably work again.
 
-**Still untested**: realistic scale (this used toy `N=8`/`hdim=4`/2 frames), and a conv-based backbone (no `conv1d` exists at all — see the `fft` section above).
+**Still untested**: realistic scale (this used toy `N=8`/`hdim=4`/2 frames), and a conv-based backbone (no `conv1d` exists at all — see the `fft` section above). Also now open: whether the examples elsewhere in this doc that were only run once or twice (K-means, BERT/ERNIE attention, `lstm_inference`/`bilstm_inference`, the hand-composed YOLO conv unit) have a similar undetected intermittent failure rate.
