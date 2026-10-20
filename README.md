@@ -130,7 +130,10 @@ Legend: ✅ confirmed working · ❌ confirmed broken · 🚫 confirmed unsuppor
 | BERT/ERNIE-era encoder inference (hand-composed, unfused attention) | ✅ | **Confirmed on real hardware**: a full single-head self-attention block (Q/K/V/output `fc` projections, `fc`+`scale`+`softmax` attention, residual `add`, `layer_norm`) matches a CPU reference exactly, with no fused `attention.h`/`page_attention.h` kernels needed. See `RESEARCH.md` and the [reusable example](docs/research/20261019-xpu1-op-testing-examples.md#1-hand-composed-berternie-style-attention--working-example) |
 | Graph neural networks (message passing) | 🚫 | `index_add`/scatter-add is gen-gated (`xpu2::`/`xpu3::` only); no SpMM anywhere in this SDK regardless of generation |
 | LLM transformer serving (RoPE/SwiGLU/RMSNorm/paged-attention) | 🚫 | Not implemented for xpu1 in this repo's `libxpuapi.so` at all (gen-gated to `xpu2::`/`xpu3::`); present-but-undispatched in the Paddle wheel's own build (see above) |
-| Custom `ggml`/llama.cpp backend via hand-written cluster kernels | ⚠️ | A real hand-written xpu1 kernel (not SDK-provided) compiles cleanly with the real XTDK compiler and runs through launch with no errors on real hardware — but doesn't complete (`xpu_wait()` doesn't return; likely missing `Context` initialization a raw-XPURT launch skips, untested pending a separate toolchain fix). See `RESEARCH.md` and `docs/research/20261019-xpu1-custom-kernel-poc.md` |
+| Custom `ggml`/llama.cpp backend via hand-written cluster kernels | ❌ | **Three independent hypotheses tested directly on real hardware, all refuted — a real hand-written xpu1 kernel compiles and launches cleanly but never completes (`xpu_wait()` hangs), regardless of:** bare XPURT vs. `baidu::xpu::api::Context`-based launch; a degenerate `<<<1,1,...>>>` config vs. matching the SDK's reference kernel's exact `<<<ncluster,64,...>>>`; and an unpartitioned kernel body vs. one with real `core_id()`/`cluster_id()`-based work partitioning matching that reference's structure. **Correction found along the way**: that "reference" kernel (`add1.xpu`) turns out to be `namespace xpu2`-specific — there is no shipped, working example of a raw custom kernel on xpu1 anywhere in this SDK. Leading hypothesis: raw custom-kernel dispatch/completion was likely never implemented or validated for this generation specifically, not a fixable mistake in kernel-writing — inferred, not confirmed by Baidu. **Not power-related**: checked directly (host's PCIe slot reports a low `SlotPowerLimit 25W`, worth a physical look, but the heaviest workload tested — full GEMM, dozens of runs — never faults while this trivially-light kernel does; no PCIe link errors ever logged). **Carries real risk**: testing this pushed the device into a persistent `state=ERROR` once, which a plain driver reload did not clear — a full reboot was required; recovery is intermittent, not guaranteed by a lighter fix. The `__float128`/XTDK-vs-modern-glibc toolchain blocker that originally stopped this investigation is fully solved (`-U__FLOAT128__ -U__SIZEOF_FLOAT128__`), so that part is no longer in the way of anyone revisiting this. See `RESEARCH.md` and `docs/research/20261019-xpu1-custom-kernel-poc.md` |
+| Speech/audio processing (ASR, audio classification) | ⚠️ | **Flagged for investigation 2026-10-20, from an external workload survey — untested on hardware.** No `conv1d` symbol exists at all (a gap for classic 1D-conv ASR architectures), but `fft<float>` exists as a flat, non-namespaced symbol — promising for the spectrogram front end most audio pipelines need. The recurrent stage would reuse the already-confirmed `lstm_inference`/`bilstm_inference` work from the OCR row below. See `RESEARCH.md`'s "Further investigation" section |
+| Image segmentation (decoder/upsampling path, distinct from detection) | ⚠️ | **Flagged for investigation 2026-10-20 — untested on hardware.** Prior CNN/YOLO testing covered only the conv+batchnorm+activation encoder path. `interpolate1d`/`interpolate2d`, `conv2d_transpose` (deconvolution), and `roi_align`/`roi_pool` all exist as flat, non-namespaced symbols — same unproven-until-tested caveat the `*_unit_fusion` precedent established. See `RESEARCH.md`'s "Further investigation" section |
+| NCF-style recommendation (embedding + dense MLP, no recurrent cell) | ⚠️ | **Flagged for investigation 2026-10-20 — untested on hardware, but a credible alternative to the CTR/ranking row above.** That row's `grnn_cell` test found a real hardware exception; Neural Collaborative Filtering doesn't need a recurrent cell at all — just `gather` (embedding lookup) + `fc` + sigmoid, every one of which is already independently proven elsewhere in this table (K-means, BERT attention). Higher-confidence than another guess from the same symbol table, specifically because it avoids the one op already shown dangerous. See `RESEARCH.md`'s "Further investigation" section |
 
 **Maintenance:** this table should be updated in the same change as any work that confirms, breaks, or newly tests one of these capabilities — see `CLAUDE.md`'s per-change checklist.
 
@@ -401,3 +404,104 @@ May 2026 archives (P2P broken, ~4–5 GB/s DMA) — **not** current:
 
 - [`results/PERF_SUMMARY.md`](results/PERF_SUMMARY.md) (2026-05-07)
 - [`results/K200_ANALYSIS_REPORT.md`](results/K200_ANALYSIS_REPORT.md) (2026-05-08)
+
+
+## Additional notes
+
+### Best workloads for the K200
+
+A. Computer vision and image recognition — Excellent fit
+
+This is one of the most straightforward applications for the K200.
+
+Potential workloads include:
+
+    Image classification: ResNet-50, ResNet-101, MobileNet, EfficientNet and similar CNNs.
+    Object detection: YOLO-family models, SSD and PP-YOLO variants.
+    Face detection: Detecting faces in images or video streams.
+    Image segmentation: Separating people, objects or regions of interest from image backgrounds.
+    Industrial inspection: Detecting defects in manufactured products, provided the selected model and its operators are supported.
+    Video analytics: Analysing frames from surveillance cameras or other video sources.
+
+Paddle Lite's Kunlunxin integration documents model examples across classification, object detection, face detection and segmentation. However, its documentation explicitly warns that not every listed model has been verified on the K200; some are validated only on the R200. You should confirm compatibility for your specific model. Source: Paddle Lite Kunlunxin integration. 【turn1view1】
+
+My recommendation: Start with ResNet-50, MobileNet or a compatible YOLO model. These are practical starting points for testing inference performance and validating the software stack.
+B. OCR and document processing — Excellent fit
+
+The K200 can be useful for document-processing pipelines that rely on neural networks.
+
+Examples include:
+
+    Invoice and receipt recognition.
+    Text detection in scanned documents.
+    License plate recognition.
+    Chinese and English text recognition.
+    Document digitisation.
+    Form and business-document processing.
+
+Paddle Lite lists PP-OCRv2 detection and recognition models, as well as CRNN-based text recognition models, among its Kunlunxin integration examples. Again, confirm which operators and model versions work on your particular K200 software stack. 【turn1view1】
+
+A typical pipeline would look like this:
+
+    The CPU decodes an image or PDF page.
+    The K200 accelerates text detection.
+    The K200 runs text recognition.
+    The CPU processes the recognised text and returns the results.
+
+This is a good use case when processing large numbers of documents in a server environment.
+C. Recommendation systems — Good fit
+
+Recommendation and ranking models are another potential application.
+
+Examples include:
+
+    Product recommendations.
+    Content recommendations.
+    User-item interaction scoring.
+    Neural collaborative filtering.
+    Neural-network-based ranking.
+
+Paddle Lite explicitly lists Neural Collaborative Filtering (NCF) as a supported model example for the broader Kunlunxin integration. The degree of K200 compatibility needs to be checked individually. 【turn1view1】
+
+One consideration is that recommendation systems can be memory-bandwidth-bound or dominated by embedding lookups rather than matrix multiplication. You should benchmark the complete workload instead of relying on peak TOPS.
+D. Speech and audio processing — Potentially suitable
+
+Possible workloads include:
+
+    Speech recognition.
+    Audio classification.
+    Voice-command recognition.
+    Neural-network-based speech processing.
+
+Kunlunxin's broader product materials describe applications involving speech recognition and natural language processing. 【turn0search7】
+
+However, that does not establish that every speech model runs efficiently on the K200.
+
+For an existing speech-recognition model, check its operator coverage, supported precision and deployment framework before committing to the card.
+E. Traditional machine learning — Depends on the algorithm
+
+The K200 can accelerate neural-network components of machine-learning systems.
+
+It may be useful for:
+
+    Multilayer perceptrons (MLPs).
+    Neural-network classifiers.
+    Dense and batched matrix operations.
+    Neural-network-based scoring and prediction.
+
+It is less compelling for algorithms that do not map naturally to its accelerator architecture.
+
+For example, ordinary CPU implementations of XGBoost, LightGBM, random forests and conventional statistical models may not benefit from the K200 without a suitable accelerator implementation.
+F. Image enhancement and neural image processing — Potentially suitable
+
+You can also investigate neural-network-based image processing, such as:
+
+    Image denoising.
+    Image restoration.
+    Super-resolution.
+    Image enhancement.
+    Segmentation-based image processing.
+
+These workloads can be attractive because they often involve substantial convolution or matrix computation.
+
+The main qualification is software support: the network must be executable through the K200's available runtime and kernels.

@@ -149,6 +149,73 @@ launch issued, waiting...
   1. `bits/floatn.h`'s `__cfloat128` typedef uses `__attribute__((__mode__(__TC__)))`, which this XTDK clang rejects ("unsupported machine mode '__TC__'"). **Worked around**: glibc guards this specifically for `defined __clang__` cases with `(!defined __INTEL_LLVM_COMPILER || !defined SYCL_LANGUAGE_VERSION)`; passing `-D__INTEL_LLVM_COMPILER=1 -DSYCL_LANGUAGE_VERSION=1` flips that condition and skips the whole block. (Harmless for our purposes — we aren't using Intel's compiler or SYCL, just borrowing the macro check to dodge this specific code path.)
   2. libstdc++'s own `<limits>` separately specializes `numeric_limits<__float128>`, gated on `defined(_GLIBCXX_USE_FLOAT128)` — and this XTDK clang rejects `__float128` as a type outright ("`__float128` is not supported on this target"), a backend-level rejection, not just the TC-mode attribute syntax. **Not worked around**: tried `-D_GLIBCXX_USE_FLOAT128=0` (doesn't help — `#if defined(X)` is true regardless of X's value) and `-U__SIZEOF_FLOAT128__` (doesn't help either — `_GLIBCXX_USE_FLOAT128` is set by some other detection this doesn't affect). This is the same general *class* of problem as the gcc14/kernel-7.0 compatibility work already extensively documented in this repo (old vendor toolchain vs. bleeding-edge host) — this specific instance just hasn't been chased to a fix yet.
 
-## Honest bottom line
+## Honest bottom line (as of 2026-10-19)
 
 This proves the XTDK-compiler-and-xpu1-target path is real and usable for writing genuinely new kernels (not just confirmed as "downloadable" — confirmed as "produces a correct device object the hardware accepts for loading"), which is meaningfully further than the compiler-availability-only conclusion reached earlier. It does **not** yet prove a hand-written kernel can be made to actually execute and return a correct result on K100/K200 — that remains open, with a concrete, scoped next step (get `baidu::xpu::api::Context`-based launch working, which first needs the `__float128`/`<limits>` issue solved, to test whether proper Context initialization is what's missing) rather than a vague "try harder."
+
+## Update 2026-10-20: the toolchain blocker is solved, the Context hypothesis is refuted, a better hypothesis found, and a more serious risk discovered
+
+Picked this back up to actually test the leading hypothesis above. XTDK (`2.7.85.2`, `ubuntu2004` variant) was re-downloaded and extracted to `~/kunlun_build/xtdk/xtdk-llvm15-ubuntu2004_x86_64` on the R730 test host (kept there, not deleted, since it's expensive to re-fetch — ~2.4 GB extracted).
+
+### The `__float128`/`<limits>` blocker: solved
+
+Isolated with a minimal reproduction (`-x xpu --xpu-arch=xpu1`, progressively including `<cstdio>` then `<limits>` alone) rather than guessing from the full `xdnn.h` error output:
+
+- **`<cstdio>` alone fails too**, not just `<limits>` — the problem is pervasive across the C++ standard library, not specific to `xdnn.h`. With the already-known `-D__INTEL_LLVM_COMPILER=1 -DSYCL_LANGUAGE_VERSION=1` workaround (for the `bits/floatn.h` `__cfloat128`/TC-mode issue), `<cstdio>` compiles clean but `<limits>` still fails.
+- **Read the actual guard in this host's real header** (`/usr/include/x86_64-linux-gnu/c++/15/bits/c++config.h`) instead of guessing: `_GLIBCXX_USE_FLOAT128` is defined under `#if defined(__FLOAT128__) || defined(__SIZEOF_FLOAT128__)`. The earlier attempt to fix this (`-D_GLIBCXX_USE_FLOAT128=0`, noted as not working in the original write-up above) couldn't have worked — the check is `defined()`, not value-based, and the real trigger is a different pair of macros entirely.
+- **Confirmed via `clang++ -dM -E` that XTDK's clang predefines *both* `__FLOAT128__` and `__SIZEOF_FLOAT128__`** for this target, even under `-x xpu --xpu-arch=xpu1` — the frontend's target-info still reports standard x86_64 float128 availability, while the actual xpu1 backend can't codegen it. This is an internal frontend/backend inconsistency in Baidu's clang fork for the xpu target, not something glibc or libstdc++ did wrong.
+- **Fix: `-U__FLOAT128__ -U__SIZEOF_FLOAT128__`** (undefining *both* — the earlier attempt only tried `-U__SIZEOF_FLOAT128__` alone, which can't work since it's an OR condition). With this plus the existing `-D__INTEL_LLVM_COMPILER=1 -DSYCL_LANGUAGE_VERSION=1`, `<limits>` compiles clean, and **the full `xpu/xdnn.h`** (pulling in `baidu::xpu::api::Context`, `create_context()`, `destroy_context()`) **compiles and links with no errors** against this host's Ubuntu 26.04/glibc 2.43/gcc 15 toolchain, under XTDK's 2021-era clang 15.
+
+Full corrected compile line (adds two flags to the "Build it" examples above):
+```bash
+$XTDK/bin/clang++ -std=c++11 -x xpu -c your_file.cpp \
+  -D __XPU1__ -D__INTEL_LLVM_COMPILER=1 -DSYCL_LANGUAGE_VERSION=1 \
+  -U__FLOAT128__ -U__SIZEOF_FLOAT128__ \
+  --target=x86_64-linux-gnu --xpu-arch=xpu1 --basename your_file \
+  -fno-builtin -fPIC -o your_file.o \
+  -I /path/to/xdnn-ubuntu_x86_64/include -I /path/to/kunlun-driver/include
+```
+
+### The Context hypothesis: tested directly, refuted
+
+Built a second launcher, identical to the original `run_add_two.cpp` except using `baidu::xpu::api::create_context()` and launching on `ctx->get_stream()` instead of a bare `xpu_stream_create()` stream. **Result: the exact same hang.** `xpu_wait()` does not return within the tested window (20–30s), regardless of whether the stream came from a `Context` or was created raw.
+
+One detail worth recording: `ctx->get_stream()` on a freshly-created `Context` returned `nullptr` — a default `Context` doesn't have a stream until `set_stream()` is called. The launch was still accepted with a null stream in both the `<<<1,1,...>>>` and `<<<1,64,...>>>` configurations below; it just never completed either way.
+
+**This refutes the original leading hypothesis.** `Context` construction is not the missing piece — whatever's wrong is something else.
+
+### A better-supported hypothesis: missing work partitioning
+
+Compared against the SDK's own one shipped, actually-used-by-its-test-suite reference kernel (`xdnn-ubuntu_x86_64/plugin/src/kernel/kunlun2cpp/add1.xpu`, launched from `src/wrapper/add2.cpp` as `xpu2::add1<<<ctx->ncluster(), 64, ctx->xpu_stream>>>(...)`). Two differences from this proof-of-concept's kernel:
+
+1. **Launch config**: the reference uses `ctx->ncluster()` clusters × **64** threads; this PoC's kernel was launched `<<<1, 1, ...>>>` — a single thread.
+2. **Work partitioning, the more likely culprit**: the reference kernel computes `core_id()`/`core_num()`/`cluster_id()`/`cluster_num()`, derives a `thread_id`/`nthreads`, and **strides its loop accordingly**, with an early-return guard (`if (cid >= ncores) return;`). This proof-of-concept's `add_two` kernel has **no such partitioning at all** — every launched thread runs the identical, full-range loop over the whole buffer, redundantly.
+
+Retried with `<<<1, 64, stream>>>` (bumping thread count to match the reference's block size) **without** adding partitioning logic to the kernel body — **same hang.** This doesn't disprove the partitioning hypothesis (64 unpartitioned threads all hammering the same `GM2LM`/`LM2GM` DMA ranges concurrently is still a plausible hang cause; more threads without fixing the actual redundant-work structure wouldn't necessarily help and could even make contention worse). It does rule out "just launch more threads" as a one-line fix. **Not yet tried**: actually adding `core_id()`/`cluster_id()`-based striding to the kernel body, matching the reference's structure. This is the next concrete step.
+
+### A more serious risk, discovered along the way
+
+The first `<<<1,1,...>>>` timeout (30s, then force-killed by the test harness's `timeout`) left the device in a state a plain driver reload (`rmmod`+`insmod`) **did** clear — matching this doc's original note above. But the *second* attempt (`<<<1,64,...>>>`, 20s timeout, force-killed the same way) left the device's compute PD in a **persistent `state=ERROR`** (confirmed via `/proc/xpu/dev0`, which also showed a stuck, unrelated `findmax_sdnn` task from a later GEMM-benchmark health-check — i.e. the error state blocks *all* subsequent compute, not just a retry of the same kernel). This time, `rmmod`+`insmod` **did not clear it** — the next full `xpu_perf_test` GEMM run hung for the full 200s timeout. **A full `sudo reboot` was required**, after which the device returned to its normal, GEMM-baseline-verified-healthy state.
+
+**This means hand-written custom-kernel testing on this card is now confirmed to carry the same severity of risk as `grnn_cell`** (see `RESEARCH.md`'s `grnn_cell` section) — not a freely-retestable activity. Concretely:
+- After any custom-kernel test that times out, **do not assume a module reload is sufficient recovery** — verify with a real compute operation (the full `xpu_perf_test` GEMM suite, not just `probe_error` or a DMA-only test like `test_host_alloc`, which can stay healthy while compute is genuinely stuck).
+- If GEMM is also stuck after a reload, a full reboot is the fix, the same as `grnn_cell` required.
+- Treat every further custom-kernel iteration as carrying this cost, and get explicit sign-off before attempting one, rather than iterating casually.
+
+## Update 2026-10-20 (continued): the partitioning hypothesis tested too — also refuted, plus a correction
+
+Tested the next concrete step directly: a second kernel (`add_two_v2.xpu`), identical to the first except adding real `core_id()`/`core_num()`/`cluster_id()`/`cluster_num()`-based work partitioning (each thread handles a distinct strided slice, with an early-return guard), launched exactly as the reference does — `<<<ctx->ncluster(), 64, stream>>>` (confirmed `ctx->ncluster()` is `4` for this device, printed at runtime, not assumed).
+
+**Result: identical hang.** Same symptom as both earlier attempts — `xpu_wait()` doesn't return within the timeout window. This time the device happened to stay healthy afterward (confirmed with a real GEMM run, not assumed) — no reload or reboot was needed, unlike the second attempt in the first round of testing. Whether a test corrupts compute state looks intermittent, not deterministic on every timeout-kill.
+
+**This refutes the partitioning hypothesis too.** Three independent variables have now been tested without changing the outcome: bare XPURT vs. `Context`-based launch; a degenerate `<<<1,1,...>>>` launch vs. matching the reference's exact `<<<ncluster,64,...>>>` config; and an unpartitioned kernel body vs. one with real `core_id()`/`cluster_id()` striding matching the reference's structure. None of it mattered — every variant hangs the same way.
+
+**Important correction, found while re-examining the "reference" kernel used for comparison:** `add1.xpu` (the one kernel this whole comparison was based on) is wrapped in `namespace xpu2 { ... }` — it targets **xpu2 hardware specifically, not xpu1**. This card is xpu1 (K100/K200). **There is no shipped, confirmed-working example anywhere in this SDK of a raw hand-written `<<<>>>` kernel launch actually completing on xpu1** — the only reference this proof-of-concept had was for a different hardware generation the whole time. That changes the picture: it's no longer "a known-good pattern that this proof-of-concept deviates from," it's "no known-good pattern for xpu1 exists in this SDK at all."
+
+**Updated leading hypothesis:** given the kernel genuinely reaches the hardware (bound to a real task queue, `xtq6`, with correctly-marshalled parameters — confirmed in the first round of testing above) but never signals completion, regardless of launch config or kernel structure, the most likely explanation is now that **raw custom-kernel dispatch and completion-signaling for xpu1 was simply never implemented or validated by Baidu** (xpu2+ got a shipped example and presumably internal test coverage; xpu1 did not) — a firmware/runtime gap specific to this generation, not a mistake in how this proof-of-concept wrote or launched its kernel. This is a hypothesis, not a proven fact — it would take either a lower-level trace (comparing the exact hardware dispatch descriptor xdnn's own working kernels use vs. what a raw `<<<>>>` launch produces) or confirmation from Baidu to establish for certain, and neither has been attempted.
+
+**On a possible power-related explanation (asked and checked 2026-10-20):** the test host's PCIe slot reports `SlotPowerLimit 25W` (`lspci -vvv`) — low for an accelerator card, and worth a physical check (Dell R730 PCIe risers are documented to have jumper-configurable power modes in some configurations). But the evidence from this testing argues against power being the cause of this specific hang: the heaviest, most power-hungry workload tested (the full GEMM benchmark, run dozens of times throughout this whole investigation) has never faulted, while the thing that does hang (a few-dozen-float custom kernel) is trivially light compute; zero PCIe AER/link-error events were ever logged; and `reset_count` stayed at 0. A genuine power-delivery problem would more plausibly show up under heavy sustained load than a near-idle one. Live power telemetry (the driver's `xpu_monitor.c`/`xpu_read_power` is internal-ioctl only, not exposed via the public XPURT API or `/proc/xpu`) wasn't pulled, so this isn't fully closed out quantitatively — but structurally, this looks like a software/firmware gap, not a power one.
+
+### Updated honest bottom line (2026-10-20, final)
+
+The compiler-and-toolchain path is fully clear, including for `Context`-based code. Three specific hypotheses for the `xpu_wait()` hang were tested directly on real hardware and all three were refuted: missing `Context` initialization, a degenerate launch configuration, and missing work partitioning. The weight of evidence now points toward raw custom-kernel dispatch on xpu1 being an unimplemented or unvalidated path in Baidu's own runtime/firmware for this specific generation, rather than anything fixable by writing the kernel differently — though this is the leading hypothesis, not a confirmed fact. Getting further would need either a lower-level dispatch-descriptor comparison against a known-working xdnn-internal kernel, or input from Baidu directly. Every attempt so far has landed somewhere between "clean hang, no lasting harm" and "device needs a full reboot" — never a clean success — so further iteration here should be treated as diminishing-returns exploration, not a likely-to-succeed next step, unless a genuinely new angle (the dispatch-descriptor comparison, or outside information) is available.
