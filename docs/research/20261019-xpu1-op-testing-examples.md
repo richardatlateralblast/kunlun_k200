@@ -653,3 +653,105 @@ Result, checked against hand-computable expectations: frame 0's magnitude spectr
 **Resolution**: the exact isolation test (the one that gave FAIL/PASS/PASS/FAIL) was rerun 10 times in a row, checking `tqinfo` before each: **10/10 clean passes.** This fault is no longer reproducible — neither `fft`, buffer management, nor queue depth was ever the real cause, and the identical signature seen with `grnn_cell` and the custom-kernel tests elsewhere in this doc has since cleared too.
 
 **Still untested**: realistic scale (this used toy `N=8`/`hdim=4`/2 frames), and a conv-based backbone (no `conv1d` exists at all — see the `fft` section above). K-means, BERT/ERNIE attention, `lstm_inference`/`bilstm_inference`, and the hand-composed YOLO conv unit were re-verified with several more runs each (see `RESEARCH.md`'s "Reverification" section) — all held up.
+
+## 10. Image segmentation ops (`interpolate2d`, `conv2d_transpose`, `roi_align`, `roi_pool`) — two confirmed working, two confirmed unimplemented
+
+**Status: mixed, all four resolved from ⚠️ to a definite answer.** Closes the "Image segmentation" row flagged 2026-10-20. All four symbols exist as concrete `<float>`/`<float,int>` instantiations in `libxpuapi.so` (confirmed with `nm -D --defined-only | c++filt` first, same diligence as every other op in this doc), but symbol presence again didn't predict runtime support — same lesson as example 2's `*_unit_fusion`.
+
+- **`interpolate2d<float>`** (nearest-neighbor upsample): ✅ confirmed working. A 1×1×2×2 image `[[1,2],[3,4]]` upsampled 2× nearest-neighbor gives exactly the hand-computed `[[1,1,2,2],[1,1,2,2],[3,3,4,4],[3,3,4,4]]`, `ret=0`, reproducible across two runs, device left healthy.
+- **`roi_align<float,int>`**: ✅ confirmed working, but **uses a legacy (non-"aligned") sub-pixel convention**, not the Detectron2/Paddle "aligned" convention with a half-pixel offset. On a 4×4 linear-ramp image (`value = 4*row+col`) with a single ROI covering the whole image and a 2×2 output, a bin's sample lands exactly on an *integer* pixel-index coordinate (no `-0.5` offset applied before interpolating), giving `[5, 7, 13, 15]` — the value at each bin's bottom-right-of-center grid point — rather than the `[2.5, 4.5, 10.5, 12.5]` a half-pixel-aligned convention would give. Confirmed by first getting a mismatch against the aligned-convention prediction, then re-deriving and matching exactly. **Anyone porting a model's RoIAlign here needs to account for this**, not assume PyTorch/Detectron2 "aligned=True" semantics.
+- **`conv2d_transpose<float,float,float,float>`**: ❌ confirmed unimplemented on xpu1. Returns immediately with `ret=4` and an explicit `[XDNN_UNIMPLEMENTED][src/wrapper/nn_conv2d_transpose.cpp:119]` trace line under `XPUAPI_DEBUG=1` — a clean, well-behaved rejection, not a hardware fault, and the device stayed fully healthy afterward.
+- **`roi_pool<float,int>`**: ❌ confirmed unimplemented on xpu1. Same `ret=4`/`XDNN_UNIMPLEMENTED` clean rejection, device stayed healthy.
+
+All four tests, plus a full GEMM+bandwidth benchmark run (`xpu_perf_test 0`, about 2 minutes, bandwidth + FP32/FP16/INT8 GEMM sweeps) afterward, left all 8 task queues `NORMAL` with `#all=0`/`#running=0` — no lingering effect from the two `UNIMPLEMENTED` rejections.
+
+```cpp
+// interpolate2d: nearest-neighbor 2x upsample of a 1x1x2x2 image.
+#include "xpu/xdnn.h"
+#include <cstdio>
+namespace api = baidu::xpu::api;
+
+int main() {
+    api::Context* ctx = api::create_context();
+    float h_x[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+    float h_y[16];
+    float *d_x, *d_y;
+    xpu_malloc((void**)&d_x, 4 * sizeof(float));
+    xpu_malloc((void**)&d_y, 16 * sizeof(float));
+    xpu_memcpy(d_x, h_x, 4 * sizeof(float), XPU_HOST_TO_DEVICE);
+
+    int r = api::interpolate2d<float>(ctx, d_x, d_y, 1, 1, 2, 2, 4, 4,
+        /*is_nearest=*/true, /*trans_mode=*/0, /*is_nchw=*/true, nullptr, nullptr, -1);
+    xpu_wait();
+    printf("ret=%d\n", r);
+    xpu_memcpy(h_y, d_y, 16 * sizeof(float), XPU_DEVICE_TO_HOST);
+    // h_y == [[1,1,2,2],[1,1,2,2],[3,3,4,4],[3,3,4,4]]
+    xpu_free(d_x); xpu_free(d_y);
+    api::destroy_context(ctx);
+    return 0;
+}
+```
+
+```cpp
+// roi_align: single whole-image ROI, 4x4 -> 2x2, legacy (non-aligned) convention.
+#include "xpu/xdnn.h"
+#include <cstdio>
+namespace api = baidu::xpu::api;
+
+int main() {
+    api::Context* ctx = api::create_context();
+    float h_x[16];
+    for (int r = 0; r < 4; r++) for (int c = 0; c < 4; c++) h_x[r*4+c] = (float)(4*r+c);
+    float h_rois[4] = {0.0f, 0.0f, 4.0f, 4.0f};
+    int h_lod[2] = {0, 1};
+    float h_y[4];
+    float *d_x, *d_rois, *d_y; int* d_lod;
+    xpu_malloc((void**)&d_x, 16*sizeof(float));
+    xpu_malloc((void**)&d_rois, 4*sizeof(float));
+    xpu_malloc((void**)&d_lod, 2*sizeof(int));
+    xpu_malloc((void**)&d_y, 4*sizeof(float));
+    xpu_memcpy(d_x, h_x, 16*sizeof(float), XPU_HOST_TO_DEVICE);
+    xpu_memcpy(d_rois, h_rois, 4*sizeof(float), XPU_HOST_TO_DEVICE);
+    xpu_memcpy(d_lod, h_lod, 2*sizeof(int), XPU_HOST_TO_DEVICE);
+
+    int r = api::roi_align<float, int>(ctx, d_x, d_y, d_rois, d_lod, 1, 1, 4, 4, 1, 2, 2,
+        /*spatial_scale=*/1.0f, /*sampling_ratio=*/1, /*is_nchw=*/true, /*mode=*/0, /*has_theta=*/false);
+    xpu_wait();
+    printf("ret=%d\n", r);
+    xpu_memcpy(h_y, d_y, 4*sizeof(float), XPU_DEVICE_TO_HOST);
+    // h_y == [5, 7, 13, 15] (legacy convention; NOT [2.5, 4.5, 10.5, 12.5])
+    xpu_free(d_x); xpu_free(d_rois); xpu_free(d_lod); xpu_free(d_y);
+    api::destroy_context(ctx);
+    return 0;
+}
+```
+
+```cpp
+// conv2d_transpose: returns XDNN_UNIMPLEMENTED (ret=4) on xpu1.
+#include "xpu/xdnn.h"
+#include <cstdio>
+#include <vector>
+namespace api = baidu::xpu::api;
+
+int main() {
+    api::Context* ctx = api::create_context();
+    float h_y[4] = {1,2,3,4}, h_w[4] = {1,1,1,1}, h_x[9];
+    float *d_y, *d_w, *d_x;
+    xpu_malloc((void**)&d_y, 4*sizeof(float));
+    xpu_malloc((void**)&d_w, 4*sizeof(float));
+    xpu_malloc((void**)&d_x, 9*sizeof(float));
+    xpu_memcpy(d_y, h_y, 4*sizeof(float), XPU_HOST_TO_DEVICE);
+    xpu_memcpy(d_w, h_w, 4*sizeof(float), XPU_HOST_TO_DEVICE);
+    std::vector<int64_t> ksize{2,2}, stride{1,1}, pad{0,0}, dilation{1,1};
+
+    int r = api::conv2d_transpose<float,float,float,float>(ctx, d_y, d_w, d_x,
+        1, 1, 2, 2, 1, ksize, stride, pad, dilation, 1, nullptr, nullptr, nullptr, true);
+    xpu_wait();
+    printf("ret=%d\n", r);  // 4, with [XDNN_UNIMPLEMENTED][src/wrapper/nn_conv2d_transpose.cpp:119]
+    xpu_free(d_y); xpu_free(d_w); xpu_free(d_x);
+    api::destroy_context(ctx);
+    return 0;
+}
+```
+
+**Still untested**: `interpolate1d` (same op family, not retested given `interpolate2d`'s clean pass), `interpolate2d`'s bilinear (`is_nearest=false`) mode and `trans_mode` variants, `roi_align`'s FP16 instantiation, multi-ROI/multi-image-batch `lod` handling, and `ps_roi_align`/`ps_roi_pool` (position-sensitive variants, not checked at all). A model's decoder path built from `interpolate2d`+`roi_align` alone (skipping `conv2d_transpose`/`roi_pool`) is the realistic feasible path on this card.
