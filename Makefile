@@ -16,6 +16,9 @@ LDFLAGS = -L$(XDNN_LIB) -lxpuapi -lxpurt -Wl,-rpath,$(XDNN_LIB)
 BENCHMARKS = benchmarks/xpu_perf_test benchmarks/xpu_denoise benchmarks/xpu_int8_probe \
 	benchmarks/xpu_app_pipeline benchmarks/xpu_pipeline_p2p
 TESTS = tests/test_p2p tests/test_p2p_verify tests/test_host_alloc tests/test_pageable_verify
+# Kept, runnable proofs-of-concept for ideas from RESEARCH.md's capability
+# investigation -- see demos/README.md. Not part of `all`/`regression`.
+DEMOS = demos/kmeans_iteration demos/ncf_recommend demos/video_pipeline_live demos/cifar10_live
 
 # The SDK ships libxpurt.so.1 but the linker's -lxpurt needs an unversioned
 # libxpurt.so symlink. Git LFS does not store it (it's not tracked content,
@@ -50,6 +53,18 @@ tests/test_host_alloc: tests/test_host_alloc.cpp | $(XDNN_LIB)/libxpurt.so
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
 
 tests/test_pageable_verify: tests/test_pageable_verify.cpp | $(XDNN_LIB)/libxpurt.so
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+
+demos/kmeans_iteration: demos/kmeans_iteration.cpp | $(XDNN_LIB)/libxpurt.so
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+
+demos/ncf_recommend: demos/ncf_recommend.cpp | $(XDNN_LIB)/libxpurt.so
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+
+demos/video_pipeline_live: demos/video_pipeline_live.cpp | $(XDNN_LIB)/libxpurt.so
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+
+demos/cifar10_live: demos/cifar10_live.cpp | $(XDNN_LIB)/libxpurt.so
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
 
 driver:
@@ -88,8 +103,10 @@ install-ko:
 	sudo scripts/install_ko_file.sh "$(KO)"
 
 clean:
-	rm -f $(BENCHMARKS) $(TESTS)
+	rm -f $(BENCHMARKS) $(TESTS) $(DEMOS)
 	$(MAKE) -C kunlun-driver clean 2>/dev/null || true
+
+demos: $(DEMOS)
 
 run: benchmarks/xpu_perf_test
 	./benchmarks/xpu_perf_test 0
@@ -107,4 +124,4 @@ cases: benchmarks/xpu_denoise benchmarks/xpu_pipeline_p2p benchmarks/xpu_app_pip
 demo:
 	scripts/run_demo.sh
 
-.PHONY: all clean run driver driver-install driver-install-norebuild install-ko regression cases demo
+.PHONY: all clean run driver driver-install driver-install-norebuild install-ko regression cases demo demos
