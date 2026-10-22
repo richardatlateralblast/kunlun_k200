@@ -941,3 +941,76 @@ int main() {
 Result: every stage `ret=0`. `reduce_mean` matched the independently host-computed spatial average exactly for both frames (e.g. frame 0: `dev=0.36318 host=0.36318`). The two frames' features genuinely differed (confirmed, not a degenerate constant pipeline). `lstm_inference`'s `last_h` was correctly tanh-bounded, and the final classifier probability landed in `[0,1]` (`0.500041`). Reproducible bit-for-bit across 5 consecutive runs; `dmesg` silent, all 8 task queues `NORMAL` throughout, and a full `xpu_perf_test 0` run afterward matched the established GEMM baseline.
 
 **Still untested**: a real multi-layer conv backbone (this reused the single conv unit from example 6), more than 2 frames, and realistic frame resolution/batch size.
+
+## 13. `batch_norm_infer<float16>`, `avg_pool2d<float>`, `max_pool2d<float,int>` — split result (one unimplemented, two working)
+
+**Status: `batch_norm_infer<float16>` confirmed `XDNN_UNIMPLEMENTED`; `avg_pool2d<float>` confirmed working; `max_pool2d<float,int>` confirmed working only with `indices=nullptr`.** Closes the pooling/FP16-batchnorm gap left open by `demos/cifar10_live` (which used a fp32-cast workaround and strided convs instead, to avoid untested ops in that first real-model attempt).
+
+```cpp
+#include "xpu/xdnn.h"
+#include <cstdio>
+#include <cmath>
+#include <vector>
+namespace xdnn = baidu::xpu::api;
+
+static float* dev_buf(const std::vector<float>& h) {
+    float* d = nullptr;
+    xpu_malloc((void**)&d, h.size() * sizeof(float));
+    xpu_memcpy(d, h.data(), h.size() * sizeof(float), XPUMemcpyKind::XPU_HOST_TO_DEVICE);
+    return d;
+}
+static float16* dev_buf16(const std::vector<float>& h) {
+    std::vector<float16> h16(h.size());
+    for (size_t i = 0; i < h.size(); i++) h16[i] = float16(h[i]);
+    float16* d = nullptr;
+    xpu_malloc((void**)&d, h16.size() * sizeof(float16));
+    xpu_memcpy(d, h16.data(), h16.size() * sizeof(float16), XPUMemcpyKind::XPU_HOST_TO_DEVICE);
+    return d;
+}
+
+int main() {
+    xpu_set_device(0);
+    auto* ctx = xdnn::create_context();
+
+    // batch_norm_infer<float16>: 1x2x2x2, chosen so (x-mean)/sqrt(var+eps)*scale+bias == x
+    // for both channels -- hand-verifiable, expected y == x exactly.
+    std::vector<float> h_x = {0,1,2,3, 4,5,6,7};
+    float16* d_x16 = dev_buf16(h_x);
+    float16* d_y16 = nullptr; xpu_malloc((void**)&d_y16, 8 * sizeof(float16));
+    std::vector<float> h_scale = {1,1}, h_bias = {0,4}, h_mean = {0,4}, h_var = {1,1};
+    float* d_scale = dev_buf(h_scale), *d_bias = dev_buf(h_bias);
+    float* d_mean = dev_buf(h_mean), *d_var = dev_buf(h_var);
+    int ret1 = xdnn::batch_norm_infer<float16>(ctx, d_x16, d_y16, 1, 2, 2, 2,
+                                                1e-5f, d_scale, d_bias, d_mean, d_var, true);
+
+    // avg_pool2d<float> / max_pool2d<float,int>: 1x1x4x4 ramp 0..15, 2x2/stride-2,
+    // no padding. Windows: TL{0,1,4,5} TR{2,3,6,7} BL{8,9,12,13} BR{10,11,14,15}.
+    // avg expected {2.5,4.5,10.5,12.5}; max expected {5,7,13,15} (ramp increases
+    // both directions, so each window's max is its bottom-right element).
+    std::vector<float> h_p(16); for (int i = 0; i < 16; i++) h_p[i] = (float)i;
+    float* d_p = dev_buf(h_p);
+    float* d_avg = nullptr; xpu_malloc((void**)&d_avg, 4 * sizeof(float));
+    int ret2 = xdnn::avg_pool2d<float>(ctx, d_p, d_avg, 1, 1, 4, 4, {2,2}, {2,2}, {0,0,0,0},
+                                        true, true, nullptr, nullptr);
+    float* d_max = nullptr; xpu_malloc((void**)&d_max, 4 * sizeof(float));
+    // indices MUST be nullptr -- a real int* buffer here hits
+    // [ASSERT-FAIL](ptr(...)==nullptr)[src/wrapper/nn_pool2d.cpp:453], a real
+    // xpu1 API constraint (indices output unsupported), not a bug in this test.
+    int ret3 = xdnn::max_pool2d<float,int>(ctx, d_p, d_max, (int*)nullptr, 1, 1, 4, 4,
+                                            {2,2}, {2,2}, {0,0,0,0}, true, nullptr, nullptr);
+    xpu_wait();
+
+    printf("batch_norm_infer<float16> ret=%d (4 == XDNN_UNIMPLEMENTED)\n", ret1);
+    printf("avg_pool2d<float> ret=%d\n", ret2);
+    printf("max_pool2d<float,int> ret=%d\n", ret3);
+    return 0;
+}
+```
+
+Result (reproduced across two runs, `tqinfo` all 8 queues `NORMAL` before and after both, full GEMM suite matching baseline afterward):
+
+- `batch_norm_infer<float16>`: `ret=4`, `XPUAPI_DEBUG=1` shows `[XDNN_UNIMPLEMENTED][src/wrapper/nn_batch_norm_infer.cpp:75]` — a clean rejection before dispatch, not a hardware fault (the output buffer holds uninitialized leftover device memory from a prior allocation, not garbage computed by a stub).
+- `avg_pool2d<float>`: `ret=0`, output `{2.500, 4.500, 10.500, 12.500}` — exact match.
+- `max_pool2d<float,int>` with a real `int*` indices buffer: `ret=1`, `[ASSERT-FAIL](ptr(8791523328)==nullptr)[src/wrapper/nn_pool2d.cpp:453]`. With `indices=nullptr` instead: `ret=0`, output `{5.0, 7.0, 13.0, 15.0}` — exact match.
+
+**Practical implication**: a forward-only xpu1 CNN can use real `avg_pool2d`/`max_pool2d` (not just strided convs as a pooling substitute, as `demos/cifar10_live` did), but must never request `max_pool2d`'s indices output — rules out a max-unpool-based decoder or a pooling backward pass on this card, same category of constraint as `roi_pool`/`conv2d_transpose` being unimplemented (see example 10 above). `batch_norm_infer<float16>`'s existing fp32-cast workaround (used throughout this doc's examples and `demos/cifar10_live`) is confirmed necessary, not just precautionary.
