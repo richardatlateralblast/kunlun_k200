@@ -18,7 +18,7 @@ BENCHMARKS = benchmarks/xpu_perf_test benchmarks/xpu_denoise benchmarks/xpu_int8
 TESTS = tests/test_p2p tests/test_p2p_verify tests/test_host_alloc tests/test_pageable_verify
 # Kept, runnable proofs-of-concept for ideas from RESEARCH.md's capability
 # investigation -- see demos/README.md. Not part of `all`/`regression`.
-DEMOS = demos/kmeans_iteration demos/ncf_recommend demos/video_pipeline_live demos/cifar10_live
+DEMOS = demos/kmeans_iteration demos/ncf_recommend demos/video_pipeline_live demos/cifar10_live demos/cifar100_live
 
 # The SDK ships libxpurt.so.1 but the linker's -lxpurt needs an unversioned
 # libxpurt.so symlink. Git LFS does not store it (it's not tracked content,
@@ -65,6 +65,9 @@ demos/video_pipeline_live: demos/video_pipeline_live.cpp | $(XDNN_LIB)/libxpurt.
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
 
 demos/cifar10_live: demos/cifar10_live.cpp | $(XDNN_LIB)/libxpurt.so
+	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
+
+demos/cifar100_live: demos/cifar100_live.cpp | $(XDNN_LIB)/libxpurt.so
 	$(CXX) $(CXXFLAGS) -o $@ $< $(LDFLAGS)
 
 driver:
